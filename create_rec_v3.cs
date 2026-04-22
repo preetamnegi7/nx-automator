@@ -1,8 +1,8 @@
 // NX Open C# Macro - Assembly Component Rotator (v3)
-// Fixes:
-//   1. Rotation now happens around each component's own axis (no Z drift / orbiting)
-//   2. Assembly constraints are suppressed before rotating so the outlet actually moves
-//   3. Current absolute orientation is read and composed, so repeated calls stack correctly
+// Fixes vs v2:
+//   1. Rotation pivot point entered in dialog – eliminates Z drift / orbiting entirely
+//   2. Constraints suppressed via UFObj.CycleObjsInPart (correct C# signature)
+//   3. Compensation delta keeps pivot stationary during MoveComponent
 //
 // Usage: Open an assembly, then run via Tools -> Journal -> Play
 
@@ -89,10 +89,11 @@ public class AssemblyRotator
         int bodyIdx, coverIdx, outletIdx;
         double coverAngle, outletAngle;
         string rotAxis;
+        Point3d pivot;
 
         bool ok = ShowSelectionDialog(allComps, autoBody, autoCover, autoOutlet,
             out bodyIdx, out coverIdx, out outletIdx,
-            out coverAngle, out outletAngle, out rotAxis);
+            out coverAngle, out outletAngle, out rotAxis, out pivot);
 
         if (!ok)
         {
@@ -105,15 +106,16 @@ public class AssemblyRotator
         lw.WriteLine("  Cover:          " + allComps[coverIdx].FullName  + "  ->  " + coverAngle  + " deg");
         lw.WriteLine("  Outlet:         " + allComps[outletIdx].FullName + "  ->  " + outletAngle + " deg");
         lw.WriteLine("  Axis:           " + rotAxis);
+        lw.WriteLine("  Pivot:          (" + pivot.X + ", " + pivot.Y + ", " + pivot.Z + ")");
         lw.WriteLine("");
 
         if (coverAngle != 0)
-            RotateComponent(workPart, allComps[coverIdx].Comp, coverAngle, rotAxis);
+            RotateComponent(workPart, allComps[coverIdx].Comp, coverAngle, rotAxis, pivot);
         else
             lw.WriteLine("  Cover: No rotation (0 degrees)");
 
         if (outletAngle != 0)
-            RotateComponent(workPart, allComps[outletIdx].Comp, outletAngle, rotAxis);
+            RotateComponent(workPart, allComps[outletIdx].Comp, outletAngle, rotAxis, pivot);
         else
             lw.WriteLine("  Outlet: No rotation (0 degrees)");
 
@@ -146,9 +148,12 @@ public class AssemblyRotator
                     else if (leaf.Length > best.Length)
                         best = leaf;
                 }
+                // FIX: GetStringAttribute is deprecated in NX8+; use GetUserAttribute
                 try
                 {
-                    string dbName = proto.GetStringAttribute("DB_PART_NAME");
+                    NXObject.AttributeInformation attr =
+                        proto.GetUserAttribute("DB_PART_NAME", NXObject.AttributeType.String, -1);
+                    string dbName = attr.StringValue;
                     if (!string.IsNullOrEmpty(dbName) && !best.ToUpper().Contains(dbName.ToUpper()))
                         best = best + "  (" + dbName + ")";
                 }
@@ -187,164 +192,49 @@ public class AssemblyRotator
     }
 
 
-    // ─── Math helpers ─────────────────────────────────────────────────────────
+    // ─── Constraint helpers ───────────────────────────────────────────────────
 
-    // Convert the 9-element csysMatrix returned by UF_ASSEM_ask_component_data
-    // into an NX Matrix3x3.
-    // UF stores column vectors: [Xcol | Ycol | Zcol] each 3 elements.
-    // NX Matrix3x3 is row-major: rows are the transformed axes.
-    static Matrix3x3 CsysArrayToMatrix(double[] a)
+    // Suppress every NXOpen.Positioning.Constraint found in the work part.
+    // Uses UFObj.CycleObjsInPart (correct ref-Tag signature; type -1 = all objects).
+    // Returns the list so they can be restored after the move.
+    static List<NXOpen.Positioning.Constraint> SuppressAllConstraints(Part workPart)
     {
-        Matrix3x3 m = new Matrix3x3();
-        // Col 0 (X axis): a[0],a[1],a[2]  ->  column 0 of rotation matrix
-        // Col 1 (Y axis): a[3],a[4],a[5]  ->  column 1
-        // Col 2 (Z axis): a[6],a[7],a[8]  ->  column 2
-        m.Xx = a[0]; m.Xy = a[3]; m.Xz = a[6];
-        m.Yx = a[1]; m.Yy = a[4]; m.Yz = a[7];
-        m.Zx = a[2]; m.Zy = a[5]; m.Zz = a[8];
-        return m;
-    }
-
-    // C = A * B  (standard matrix multiplication)
-    static Matrix3x3 MatMul(Matrix3x3 A, Matrix3x3 B)
-    {
-        Matrix3x3 C = new Matrix3x3();
-        C.Xx = A.Xx*B.Xx + A.Xy*B.Yx + A.Xz*B.Zx;
-        C.Xy = A.Xx*B.Xy + A.Xy*B.Yy + A.Xz*B.Zy;
-        C.Xz = A.Xx*B.Xz + A.Xy*B.Yz + A.Xz*B.Zz;
-        C.Yx = A.Yx*B.Xx + A.Yy*B.Yx + A.Yz*B.Zx;
-        C.Yy = A.Yx*B.Xy + A.Yy*B.Yy + A.Yz*B.Zy;
-        C.Yz = A.Yx*B.Xz + A.Yy*B.Yz + A.Yz*B.Zz;
-        C.Zx = A.Zx*B.Xx + A.Zy*B.Yx + A.Zz*B.Zx;
-        C.Zy = A.Zx*B.Xy + A.Zy*B.Yy + A.Zz*B.Zy;
-        C.Zz = A.Zx*B.Xz + A.Zy*B.Yz + A.Zz*B.Zz;
-        return C;
-    }
-
-    static Matrix3x3 IdentityMatrix()
-    {
-        Matrix3x3 m = new Matrix3x3();
-        m.Xx = 1; m.Yy = 1; m.Zz = 1;
-        return m;
-    }
-
-
-    // ─── UF-layer helpers ─────────────────────────────────────────────────────
-
-    // Returns the component's absolute origin and orientation (via NX UF layer).
-    static bool GetComponentTransform(Component comp,
-        out Point3d origin, out Matrix3x3 orient)
-    {
-        origin = new Point3d(0, 0, 0);
-        orient = IdentityMatrix();
+        var suppressed = new List<NXOpen.Positioning.Constraint>();
         try
         {
             UFSession ufs = UFSession.GetUFSession();
-            string refSet, instName;
-            double[] o  = new double[3];
-            double[] cm = new double[9];   // direction cosines of component CSYS axes
-            double[] tf = new double[16];  // 4x4 homogeneous transform (not used here)
-            ufs.Assem.AskComponentData(comp.Tag, out refSet, out instName, o, cm, tf);
-            origin = new Point3d(o[0], o[1], o[2]);
-            orient = CsysArrayToMatrix(cm);
-            return true;
-        }
-        catch (Exception ex)
-        {
-            lw.WriteLine("  Warning: cannot read component transform (" + ex.Message + ").");
-            lw.WriteLine("           Using identity – rotation may have positional drift.");
-            return false;
-        }
-    }
-
-    // Suppress all assembly (positioning) constraints that involve this component.
-    // Returns the list of suppressed constraints so they can be restored later.
-    static List<NXObject> SuppressComponentConstraints(Component comp, Part workPart)
-    {
-        var suppressed = new List<NXObject>();
-
-        // Strategy A: NXOpen.Positioning.Constraint (NX 9+)
-        try
-        {
-            foreach (NXObject obj in workPart.Constraints)
+            Tag cycleTag = Tag.Null;
+            ufs.Obj.CycleObjsInPart(workPart.Tag, -1, ref cycleTag);   // -1 = UF_OBJ_NO_TYPE (all)
+            while (cycleTag != Tag.Null)
             {
                 try
                 {
-                    NXOpen.Positioning.Constraint c = obj as NXOpen.Positioning.Constraint;
-                    if (c == null || c.Suppressed) continue;
-
-                    bool involves = false;
-                    try
-                    {
-                        // Check each geometry in the constraint to see if it belongs
-                        // to the component we care about.
-                        NXOpen.Positioning.ConstraintReference[] refs = c.GetConstraintReferences();
-                        foreach (var r in refs)
-                        {
-                            NXObject geom = r.GetGeometry();
-                            if (geom != null && geom.IsOccurrence)
-                            {
-                                NXObject owner = geom.GetOwningComponent();
-                                if (owner != null && owner.Tag == comp.Tag)
-                                { involves = true; break; }
-                            }
-                        }
-                    }
-                    catch
-                    {
-                        // If we cannot check, be conservative and suppress it.
-                        involves = true;
-                    }
-
-                    if (involves)
+                    // NXObjectManager.Get returns TaggedObject; cast directly to what we need.
+                    NXOpen.Positioning.Constraint c =
+                        NXOpen.Utilities.NXObjectManager.Get(cycleTag) as NXOpen.Positioning.Constraint;
+                    if (c != null && !c.Suppressed)
                     {
                         c.Suppressed = true;
                         suppressed.Add(c);
                     }
                 }
                 catch { }
+                ufs.Obj.CycleObjsInPart(workPart.Tag, -1, ref cycleTag);
             }
         }
-        catch { }
-
-        // Strategy B: UF layer – iterate tags for older NX builds
-        if (suppressed.Count == 0)
+        catch (Exception ex)
         {
-            try
-            {
-                UFSession ufs = UFSession.GetUFSession();
-                Tag nextTag = ufs.Obj.CycleByName(workPart.Tag, "CONSTRAINT");
-                while (nextTag != Tag.Null)
-                {
-                    try
-                    {
-                        NXObject obj = NXOpen.Utilities.NXObjectManager.Get(nextTag);
-                        NXOpen.Positioning.Constraint c = obj as NXOpen.Positioning.Constraint;
-                        if (c != null && !c.Suppressed)
-                        {
-                            c.Suppressed = true;
-                            suppressed.Add(c);
-                        }
-                    }
-                    catch { }
-                    nextTag = ufs.Obj.CycleByName(workPart.Tag, "CONSTRAINT");
-                }
-            }
-            catch { }
+            lw.WriteLine("  Warning: constraint suppression failed (" + ex.Message + ").");
+            lw.WriteLine("           Manually suppress constraints if rotation is blocked.");
         }
-
         return suppressed;
     }
 
-    static void RestoreConstraints(List<NXObject> constraints)
+    static void RestoreConstraints(List<NXOpen.Positioning.Constraint> constraints)
     {
-        foreach (NXObject obj in constraints)
+        foreach (NXOpen.Positioning.Constraint c in constraints)
         {
-            try
-            {
-                NXOpen.Positioning.Constraint c = obj as NXOpen.Positioning.Constraint;
-                if (c != null) c.Suppressed = false;
-            }
+            try { c.Suppressed = false; }
             catch { }
         }
     }
@@ -352,8 +242,11 @@ public class AssemblyRotator
 
     // ─── Core rotation ────────────────────────────────────────────────────────
 
+    // Rotates 'comp' by 'angleDegrees' around the specified world axis,
+    // keeping 'pivot' stationary (pivot = a point on the rotation axis,
+    // typically the body/assembly origin entered by the user).
     static void RotateComponent(Part workPart, Component comp,
-        double angleDegrees, string axis)
+        double angleDegrees, string axis, Point3d pivot)
     {
         string name = GetBestName(comp);
         lw.WriteLine("  Rotating: " + name);
@@ -363,42 +256,30 @@ public class AssemblyRotator
         double cos = Math.Cos(rad);
         double sin = Math.Sin(rad);
 
-        // Incremental rotation matrix around the chosen world axis
+        // Rotation matrix (incremental, around chosen world axis)
         Matrix3x3 dR = new Matrix3x3();
         switch (axis)
         {
             case "X":
-                dR.Xx = 1;   dR.Xy = 0;    dR.Xz = 0;
-                dR.Yx = 0;   dR.Yy = cos;  dR.Yz = -sin;
-                dR.Zx = 0;   dR.Zy = sin;  dR.Zz = cos;
+                dR.Xx = 1;    dR.Xy = 0;    dR.Xz = 0;
+                dR.Yx = 0;    dR.Yy = cos;  dR.Yz = -sin;
+                dR.Zx = 0;    dR.Zy = sin;  dR.Zz = cos;
                 break;
             case "Y":
-                dR.Xx = cos; dR.Xy = 0;    dR.Xz = sin;
-                dR.Yx = 0;   dR.Yy = 1;    dR.Yz = 0;
-                dR.Zx = -sin;dR.Zy = 0;    dR.Zz = cos;
+                dR.Xx = cos;  dR.Xy = 0;    dR.Xz = sin;
+                dR.Yx = 0;    dR.Yy = 1;    dR.Yz = 0;
+                dR.Zx = -sin; dR.Zy = 0;    dR.Zz = cos;
                 break;
             default: // Z
-                dR.Xx = cos; dR.Xy = -sin; dR.Xz = 0;
-                dR.Yx = sin; dR.Yy = cos;  dR.Yz = 0;
-                dR.Zx = 0;   dR.Zy = 0;    dR.Zz = 1;
+                dR.Xx = cos;  dR.Xy = -sin; dR.Xz = 0;
+                dR.Yx = sin;  dR.Yy = cos;  dR.Yz = 0;
+                dR.Zx = 0;    dR.Zy = 0;    dR.Zz = 1;
                 break;
         }
 
-        // Read the component's current absolute position and orientation.
-        Point3d P;
-        Matrix3x3 currentOrient;
-        GetComponentTransform(comp, out P, out currentOrient);
-
-        lw.WriteLine("  Current origin: (" +
-            P.X.ToString("F4") + ", " +
-            P.Y.ToString("F4") + ", " +
-            P.Z.ToString("F4") + ")");
-
-        // ── Fix 1: compensation translation ──────────────────────────────────
-        // MoveComponent rotates every world-space point p  =>  dR*p + delta.
-        // To keep the component's own origin fixed we need:
-        //   dR * P + delta = P   =>   delta = P - dR*P = (I - dR)*P
-        double px = P.X, py = P.Y, pz = P.Z;
+        // MoveComponent maps every world-space point p  →  dR*p + delta.
+        // To keep 'pivot' fixed:  dR*pivot + delta = pivot  →  delta = pivot - dR*pivot
+        double px = pivot.X, py = pivot.Y, pz = pivot.Z;
         double rpx = dR.Xx*px + dR.Xy*py + dR.Xz*pz;
         double rpy = dR.Yx*px + dR.Yy*py + dR.Yz*pz;
         double rpz = dR.Zx*px + dR.Zy*py + dR.Zz*pz;
@@ -409,71 +290,50 @@ public class AssemblyRotator
             delta.Y.ToString("F4") + ", " +
             delta.Z.ToString("F4") + ")");
 
-        // New absolute orientation = dR * currentOrient
-        // (applying the incremental rotation on top of the existing orientation)
-        Matrix3x3 newOrient = MatMul(dR, currentOrient);
+        // Suppress constraints so they cannot fight the rotation
+        List<NXOpen.Positioning.Constraint> suppressed = SuppressAllConstraints(workPart);
+        lw.WriteLine("  Suppressed " + suppressed.Count + " constraint(s).");
 
-        // ── Fix 2: suppress constraints so they don't fight the rotation ──────
-        List<NXObject> suppressed = SuppressComponentConstraints(comp, workPart);
-        if (suppressed.Count > 0)
-            lw.WriteLine("  Suppressed " + suppressed.Count + " constraint(s).");
-        else
-            lw.WriteLine("  No constraints found (or already suppressed).");
-
-        // ── Apply the move ────────────────────────────────────────────────────
+        // Apply the move
         bool success = false;
         try
         {
-            // Pass newOrient (absolute orientation after rotation) + delta (keeps origin fixed).
-            workPart.ComponentAssembly.MoveComponent(comp, delta, newOrient);
-            lw.WriteLine("  OK: rotated with composed orientation.");
+            workPart.ComponentAssembly.MoveComponent(comp, delta, dR);
+            lw.WriteLine("  OK: Rotation applied.");
             success = true;
         }
-        catch (Exception ex1)
+        catch (Exception ex)
         {
-            lw.WriteLine("  Attempt 1 failed (" + ex1.Message + "), trying incremental dR...");
-            try
-            {
-                // Fallback: some NX versions prefer just the incremental dR.
-                workPart.ComponentAssembly.MoveComponent(comp, delta, dR);
-                lw.WriteLine("  OK: rotated with incremental dR.");
-                success = true;
-            }
-            catch (Exception ex2)
-            {
-                lw.WriteLine("  ERROR: " + ex2.Message);
-                lw.WriteLine("  Manual fix: in Assembly Navigator, right-click the component");
-                lw.WriteLine("  -> 'Assembly Constraints' -> suppress all constraints, then retry.");
-            }
+            lw.WriteLine("  ERROR: " + ex.Message);
+            lw.WriteLine("  Manual fix: Assembly Navigator -> right-click component");
+            lw.WriteLine("  -> 'Assembly Constraints' -> suppress all, then retry.");
         }
 
-        // Restore constraints so the assembly stays properly constrained
-        // for any subsequent operations.
-        if (suppressed.Count > 0)
-        {
-            RestoreConstraints(suppressed);
-            if (success)
-                lw.WriteLine("  Constraints restored.");
-        }
+        // Restore constraints
+        RestoreConstraints(suppressed);
+        if (success && suppressed.Count > 0)
+            lw.WriteLine("  Constraints restored.");
 
         lw.WriteLine("");
     }
 
 
-    // ─── Selection dialog (unchanged from v2) ─────────────────────────────────
+    // ─── Selection dialog ─────────────────────────────────────────────────────
 
     static bool ShowSelectionDialog(List<CompInfo> allComps,
         int autoBody, int autoCover, int autoOutlet,
         out int bodyIdx, out int coverIdx, out int outletIdx,
-        out double coverAngle, out double outletAngle, out string rotAxis)
+        out double coverAngle, out double outletAngle,
+        out string rotAxis, out Point3d pivot)
     {
         bodyIdx = 0; coverIdx = 0; outletIdx = 0;
         coverAngle = 0; outletAngle = 0; rotAxis = "Z";
+        pivot = new Point3d(0, 0, 0);
 
         Form form = new Form();
         form.Text = "Assembly Component Rotator v3";
         form.Width = 620;
-        form.Height = 580;
+        form.Height = 680;   // taller to fit pivot fields
         form.StartPosition = FormStartPosition.CenterScreen;
         form.TopMost = true;
         form.FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -530,14 +390,39 @@ public class AssemblyRotator
         sep2.Left = labelX; sep2.Top = y; sep2.Width = comboW; sep2.Height = 1;
         form.Controls.Add(sep2); y += 12;
 
-        // Axis
+        // Rotation axis
         AddLabel(form, "Rotation Axis:", new Font("Segoe UI", 9, FontStyle.Bold),
             Color.Black, labelX, y, 120);
         RadioButton radioZ = AddRadio(form, "Z-Axis (vertical)", true,  140, y, 145);
         RadioButton radioX = AddRadio(form, "X-Axis",           false, 290, y, 100);
         RadioButton radioY = AddRadio(form, "Y-Axis",           false, 400, y, 100);
-        y += 45;
+        y += 35;
 
+        // Pivot point
+        Panel sep3 = new Panel();
+        sep3.BackColor = Color.FromArgb(220, 220, 220);
+        sep3.Left = labelX; sep3.Top = y; sep3.Width = comboW; sep3.Height = 1;
+        form.Controls.Add(sep3); y += 12;
+
+        AddLabel(form, "Rotation Axis Point  (a point that lies on the axis – usually body origin):",
+            new Font("Segoe UI", 9, FontStyle.Bold), Color.FromArgb(80, 0, 120), labelX, y, 540);
+        y += 20;
+
+        AddLabel(form, "X:", form.Font, Color.Black, labelX,      y + 3, 20);
+        TextBox pivotXBox = AddTextBox(form, "0", labelX + 20,    y, 70);
+        AddLabel(form, "Y:", form.Font, Color.Black, labelX + 100, y + 3, 20);
+        TextBox pivotYBox = AddTextBox(form, "0", labelX + 120,   y, 70);
+        AddLabel(form, "Z:", form.Font, Color.Black, labelX + 200, y + 3, 20);
+        TextBox pivotZBox = AddTextBox(form, "0", labelX + 220,   y, 70);
+
+        Label pivotHint = new Label();
+        pivotHint.Text = "Tip: open NX Information -> Object to read the body origin coordinates.";
+        pivotHint.ForeColor = Color.Gray;
+        pivotHint.Left = labelX; pivotHint.Top = y + 26; pivotHint.Width = 540;
+        form.Controls.Add(pivotHint);
+        y += 55;
+
+        // Buttons
         Button okBtn = new Button();
         okBtn.Text = "Apply Rotation";
         okBtn.Font = new Font("Segoe UI", 10, FontStyle.Bold);
@@ -570,9 +455,16 @@ public class AssemblyRotator
         if (!double.TryParse(outletAngleBox.Text, out outletAngle)) outletAngle = 0;
         rotAxis = radioX.Checked ? "X" : (radioY.Checked ? "Y" : "Z");
 
+        double pivX = 0, pivY = 0, pivZ = 0;
+        double.TryParse(pivotXBox.Text, out pivX);
+        double.TryParse(pivotYBox.Text, out pivY);
+        double.TryParse(pivotZBox.Text, out pivZ);
+        pivot = new Point3d(pivX, pivY, pivZ);
+
         form.Dispose();
         return true;
     }
+
 
     // ─── Dialog control helpers ───────────────────────────────────────────────
 
