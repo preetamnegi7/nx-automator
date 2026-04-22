@@ -19,7 +19,7 @@
 //   A dialog checkbox lets the user restore them if needed.
 // * MoveComponent is used with pivot-compensation delta (pivot - R*pivot)
 //   so the component rotates around the specified pivot point.
-// * Auto-pivot is read from the body's origin via AskComponentData.
+// * Auto-pivot is read from the body's origin via Component.GetPosition (managed API).
 //
 // Usage: Open an assembly, then run via Tools -> Journal -> Play
 
@@ -158,20 +158,17 @@ public class AssemblyRotator
 
 
     // ─── Component origin helper ──────────────────────────────────────────────
-    // UF_ASSEM_ask_absocc_transform is not wrapped in C# for all NX versions.
-    // AskComponentData (6-arg form) is the reliable fallback.
+    // Component.GetPosition is the managed NX Open C# API that returns the
+    // component's world-space origin and orientation directly (no UF needed).
 
     static Point3d TryGetComponentOrigin(Component comp)
     {
         try
         {
-            string partName, refSetName;
-            int layer;
-            double[] origin = new double[3];
-            double[] csys   = new double[9];
-            UFSession.GetUFSession().Assem.AskComponentData(
-                comp.Tag, out partName, out refSetName, out layer, origin, csys);
-            return new Point3d(origin[0], origin[1], origin[2]);
+            Point3d origin;
+            Matrix3x3 orientation;
+            comp.GetPosition(out origin, out orientation);
+            return origin;
         }
         catch { }
         return new Point3d(0, 0, 0);
@@ -453,7 +450,7 @@ public class AssemblyRotator
         FL(form, "Z:", form.Font, Color.Black, lx+200,  y+3, 18);
         TextBox pivZ = FT(form, defaultPivot.Z.ToString("F3"), lx+218,  y, 72);
         y += 30;
-        FL(form, "Tip: see Listing Window for col-major vs row-major origin values to verify.",
+        FL(form, "Tip: pivot = body center. Auto-detected via Component.GetPosition — override if wrong.",
             form.Font, Color.Gray, lx, y, 560); y += 24;
 
         HS(form, lx, y, cw); y += 12;
