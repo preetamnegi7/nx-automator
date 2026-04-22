@@ -9,17 +9,17 @@
 //    distance constraints that it no longer could satisfy after the XY move.
 //
 // 2. Outlet fully blocked
-//    Root cause: NXOpen.Positioning.Constraint casting via NXObjectManager may
-//    return null for older-style mating conditions.  Added UFObj.SetSuppression
-//    which works on ANY object tag regardless of C# wrapper type.
+//    Root cause: constraints were still active and the solver reverted the move
+//    because it could not satisfy them in the new position.
 //
 // Fix summary
 // ───────────
-// * Constraints are suppressed and LEFT suppressed after rotation so the
-//   new position holds.  A dialog checkbox lets the user restore them if needed.
-// * RepositionInstance is used to write the 4x4 transform directly, bypassing
-//   the constraint solver.  MoveComponent is kept as a fallback.
-// * Auto-pivot is read from the body's absolute transform via AskAbsoccTransform.
+// * Constraints are suppressed (NXOpen.Positioning.Constraint.Suppressed = true)
+//   and LEFT suppressed after rotation so the new position holds.
+//   A dialog checkbox lets the user restore them if needed.
+// * MoveComponent is used with pivot-compensation delta (pivot - R*pivot)
+//   so the component rotates around the specified pivot point.
+// * Auto-pivot is read from the body's origin via AskComponentData.
 //
 // Usage: Open an assembly, then run via Tools -> Journal -> Play
 
@@ -106,8 +106,7 @@ public class AssemblyRotator
         Point3d defaultPivot = new Point3d(0, 0, 0);
         if (autoBody >= 0)
         {
-            double[,] bodyT = GetAbsoluteTransform(allComps[autoBody].Comp, false);
-            defaultPivot = ExtractOrigin(bodyT, false);
+            defaultPivot = TryGetComponentOrigin(allComps[autoBody].Comp);
             lw.WriteLine("Auto-pivot (body origin): (" +
                 defaultPivot.X.ToString("F3") + ", " +
                 defaultPivot.Y.ToString("F3") + ", " +
@@ -158,45 +157,24 @@ public class AssemblyRotator
     }
 
 
-    // ─── 4×4 transform helpers ────────────────────────────────────────────────
-    //
-    // NX's UF_ASSEM_ask_absocc_transform returns a 4x4 stored in two possible
-    // conventions.  We log both so the user can tell from the listing window
-    // which interpretation gives sensible body-origin values.
-    //
-    //   Column-major (typical NX UF): origin = T[3, 0..2]
-    //   Row-major    (alternative):   origin = T[0..2, 3]
+    // ─── Component origin helper ──────────────────────────────────────────────
+    // UF_ASSEM_ask_absocc_transform is not wrapped in C# for all NX versions.
+    // AskComponentData (6-arg form) is the reliable fallback.
 
-    static double[,] GetAbsoluteTransform(Component comp, bool verbose)
+    static Point3d TryGetComponentOrigin(Component comp)
     {
-        double[,] T = new double[4, 4];
-        T[0,0] = T[1,1] = T[2,2] = T[3,3] = 1.0;  // identity fallback
         try
         {
-            UFSession.GetUFSession().Assem.AskAbsoccTransform(comp.Tag, T);
+            string partName, refSetName;
+            int layer;
+            double[] origin = new double[3];
+            double[] csys   = new double[9];
+            UFSession.GetUFSession().Assem.AskComponentData(
+                comp.Tag, out partName, out refSetName, out layer, origin, csys);
+            return new Point3d(origin[0], origin[1], origin[2]);
         }
-        catch (Exception ex)
-        {
-            if (verbose)
-                lw.WriteLine("  Warning: AskAbsoccTransform failed (" + ex.Message + "). Using identity.");
-        }
-        return T;
-    }
-
-    static Point3d ExtractOrigin(double[,] T, bool verbose)
-    {
-        Point3d colMajor = new Point3d(T[3, 0], T[3, 1], T[3, 2]);
-        Point3d rowMajor = new Point3d(T[0, 3], T[1, 3], T[2, 3]);
-        if (verbose)
-        {
-            lw.WriteLine("    Origin (col-major T[3,0..2]): " +
-                colMajor.X.ToString("F3") + ", " + colMajor.Y.ToString("F3") + ", " + colMajor.Z.ToString("F3"));
-            lw.WriteLine("    Origin (row-major T[0..2,3]): " +
-                rowMajor.X.ToString("F3") + ", " + rowMajor.Y.ToString("F3") + ", " + rowMajor.Z.ToString("F3"));
-        }
-        // Use column-major by default.  If your assembly shows wrong pivot values,
-        // change this to: return rowMajor;
-        return colMajor;
+        catch { }
+        return new Point3d(0, 0, 0);
     }
 
     // 3×3 rotation matrix as double[row, col]
@@ -226,30 +204,6 @@ public class AssemblyRotator
         return dR;
     }
 
-    // New 4×4 = rotate existing axes + rotate origin around pivot.
-    // Column-major: axis columns T[0..2, 0..2], origin T[3, 0..2].
-    static double[,] BuildNewTransform(double[,] T, double[,] dR, Point3d pivot)
-    {
-        double[,] Tn = new double[4, 4];
-        Tn[3, 3] = 1.0;
-
-        // Rotate each direction column: new_col[row] = sum_k dR[row,k] * T[col,k]
-        for (int col = 0; col < 3; col++)
-        {
-            for (int row = 0; row < 3; row++)
-                Tn[col, row] = dR[row, 0]*T[col, 0] + dR[row, 1]*T[col, 1] + dR[row, 2]*T[col, 2];
-            Tn[col, 3] = 0.0;
-        }
-
-        // Rotate origin around pivot: Tn_origin = dR * (origin - pivot) + pivot
-        double ox = T[3, 0] - pivot.X, oy = T[3, 1] - pivot.Y, oz = T[3, 2] - pivot.Z;
-        Tn[3, 0] = dR[0,0]*ox + dR[0,1]*oy + dR[0,2]*oz + pivot.X;
-        Tn[3, 1] = dR[1,0]*ox + dR[1,1]*oy + dR[1,2]*oz + pivot.Y;
-        Tn[3, 2] = dR[2,0]*ox + dR[2,1]*oy + dR[2,2]*oz + pivot.Z;
-        Tn[3, 3] = 1.0;
-        return Tn;
-    }
-
     static Matrix3x3 ToNXMatrix(double[,] dR)
     {
         Matrix3x3 m = new Matrix3x3();
@@ -261,30 +215,21 @@ public class AssemblyRotator
 
 
     // ─── Constraint suppression ───────────────────────────────────────────────
-    //
-    // Two-path suppression:
-    //   Path A  – NXOpen.Positioning.Constraint.Suppressed = true  (NX9+)
-    //   Path B  – UFObj.SetSuppression on the raw tag               (all versions)
-    // Both paths are tried for every object found.  The tags are stored so the
-    // caller can restore if requested.
+    // UFObj.AskSuppression / SetSuppression are not available in all NX C# builds.
+    // We rely solely on NXOpen.Positioning.Constraint.Suppressed (NX9+).
 
-    static List<Tag> SuppressAllConstraints(Part workPart)
+    static List<NXOpen.Positioning.Constraint> SuppressAllConstraints(Part workPart)
     {
-        var suppressedTags = new List<Tag>();
-        int total = 0;
-
-        UFSession ufs = UFSession.GetUFSession();
-
+        var suppressed = new List<NXOpen.Positioning.Constraint>();
+        int scanned = 0;
         try
         {
+            UFSession ufs = UFSession.GetUFSession();
             Tag tag = Tag.Null;
             ufs.Obj.CycleObjsInPart(workPart.Tag, -1, ref tag);
             while (tag != Tag.Null)
             {
-                total++;
-                bool suppressed = false;
-
-                // Path A: try as NXOpen.Positioning.Constraint
+                scanned++;
                 try
                 {
                     NXOpen.Positioning.Constraint c =
@@ -292,40 +237,10 @@ public class AssemblyRotator
                     if (c != null && !c.Suppressed)
                     {
                         c.Suppressed = true;
-                        suppressed = true;
+                        suppressed.Add(c);
                     }
                 }
                 catch { }
-
-                // Path B: try UFObj.SetSuppression on raw tag (works on ANY constraint type)
-                if (!suppressed)
-                {
-                    try
-                    {
-                        int currentState;
-                        ufs.Obj.AskSuppression(tag, out currentState);
-                        if (currentState == 0)  // 0 = unsuppressed in NX UF
-                        {
-                            // Check if this looks like a constraint by type
-                            int objType, objSubtype;
-                            ufs.Obj.AskTypeAndSubtype(tag, out objType, out objSubtype);
-                            // NX UF constraint type is typically 70 (UF_constraint_type)
-                            // Assembly constraint type is typically 850+
-                            // We suppress types that are commonly constraints
-                            if (objType == 70 || objType == 850 || objType == 851 ||
-                                objType == 852 || objType == 853 || objType == 854)
-                            {
-                                ufs.Obj.SetSuppression(tag, 1);  // 1 = suppressed
-                                suppressed = true;
-                            }
-                        }
-                    }
-                    catch { }
-                }
-
-                if (suppressed)
-                    suppressedTags.Add(tag);
-
                 ufs.Obj.CycleObjsInPart(workPart.Tag, -1, ref tag);
             }
         }
@@ -333,29 +248,16 @@ public class AssemblyRotator
         {
             lw.WriteLine("  Warning: CycleObjsInPart failed: " + ex.Message);
         }
-
-        lw.WriteLine("  Objects scanned: " + total +
-                     "  |  Suppressed: " + suppressedTags.Count);
-        return suppressedTags;
+        lw.WriteLine("  Objects scanned: " + scanned +
+                     "  |  Suppressed: " + suppressed.Count);
+        return suppressed;
     }
 
-    static void RestoreConstraintTags(List<Tag> tags)
+    static void RestoreConstraints(List<NXOpen.Positioning.Constraint> constraints)
     {
-        UFSession ufs = UFSession.GetUFSession();
-        foreach (Tag tag in tags)
+        foreach (NXOpen.Positioning.Constraint c in constraints)
         {
-            // Path A
-            try
-            {
-                NXOpen.Positioning.Constraint c =
-                    NXOpen.Utilities.NXObjectManager.Get(tag) as NXOpen.Positioning.Constraint;
-                if (c != null) c.Suppressed = false;
-            }
-            catch { }
-
-            // Path B
-            try { ufs.Obj.SetSuppression(tag, 0); }  // 0 = unsuppressed
-            catch { }
+            try { c.Suppressed = false; } catch { }
         }
     }
 
@@ -368,80 +270,38 @@ public class AssemblyRotator
         string name = GetBestName(comp);
         lw.WriteLine("─── " + name + " ───");
         lw.WriteLine("  Angle: " + angleDeg + " deg   Axis: " + axis);
-
-        // Read and log current transform
-        double[,] T = GetAbsoluteTransform(comp, true);
-        Point3d originBefore = ExtractOrigin(T, true);
         lw.WriteLine("  Pivot: (" + pivot.X.ToString("F3") + ", " +
                       pivot.Y.ToString("F3") + ", " + pivot.Z.ToString("F3") + ")");
 
-        double[,] dR   = BuildDR(angleDeg, axis);
-        double[,] T_new = BuildNewTransform(T, dR, pivot);
+        double[,] dR = BuildDR(angleDeg, axis);
 
-        // ── Step 1: suppress constraints ─────────────────────────────────────
-        // This prevents the constraint solver from fighting the move.
-        // Key: we do NOT restore by default so the new position holds.
-        List<Tag> suppressed = SuppressAllConstraints(workPart);
+        // delta = pivot - R*pivot  →  MoveComponent rotates the component
+        // around the given pivot point rather than around the world origin.
+        double px = pivot.X, py = pivot.Y, pz = pivot.Z;
+        Vector3d delta = new Vector3d(
+            px - (dR[0,0]*px + dR[0,1]*py + dR[0,2]*pz),
+            py - (dR[1,0]*px + dR[1,1]*py + dR[1,2]*pz),
+            pz - (dR[2,0]*px + dR[2,1]*py + dR[2,2]*pz));
 
-        // ── Step 2: reposition ───────────────────────────────────────────────
-        bool success = false;
+        // Step 1: suppress constraints so the solver cannot revert the move.
+        // Constraints are left suppressed by default (controlled by dialog checkbox).
+        var suppressed = SuppressAllConstraints(workPart);
 
-        // Primary: RepositionInstance writes the 4×4 transform directly,
-        // bypassing the constraint solver completely.
+        // Step 2: apply the incremental rotation around the pivot.
         try
         {
-            UFSession.GetUFSession().Assem.RepositionInstance(comp.Tag, T_new);
-            lw.WriteLine("  RepositionInstance: OK");
-            success = true;
+            workPart.ComponentAssembly.MoveComponent(comp, delta, ToNXMatrix(dR));
+            lw.WriteLine("  MoveComponent: OK");
         }
-        catch (Exception ex1)
+        catch (Exception ex)
         {
-            lw.WriteLine("  RepositionInstance failed: " + ex1.Message);
-
-            // Fallback: MoveComponent with pivot-compensation delta
-            try
-            {
-                double px = pivot.X, py = pivot.Y, pz = pivot.Z;
-                Vector3d delta = new Vector3d(
-                    px - (dR[0,0]*px + dR[0,1]*py + dR[0,2]*pz),
-                    py - (dR[1,0]*px + dR[1,1]*py + dR[1,2]*pz),
-                    pz - (dR[2,0]*px + dR[2,1]*py + dR[2,2]*pz));
-
-                workPart.ComponentAssembly.MoveComponent(comp, delta, ToNXMatrix(dR));
-                lw.WriteLine("  MoveComponent fallback: OK");
-                success = true;
-            }
-            catch (Exception ex2)
-            {
-                lw.WriteLine("  MoveComponent fallback failed: " + ex2.Message);
-            }
+            lw.WriteLine("  MoveComponent failed: " + ex.Message);
         }
 
-        // ── Step 3: verify by reading position again ─────────────────────────
-        if (success)
-        {
-            double[,] Ta = GetAbsoluteTransform(comp, false);
-            Point3d originAfter = ExtractOrigin(Ta, false);
-            lw.WriteLine("  Origin before: (" +
-                originBefore.X.ToString("F3") + ", " +
-                originBefore.Y.ToString("F3") + ", " +
-                originBefore.Z.ToString("F3") + ")");
-            lw.WriteLine("  Origin after:  (" +
-                originAfter.X.ToString("F3") + ", " +
-                originAfter.Y.ToString("F3") + ", " +
-                originAfter.Z.ToString("F3") + ")");
-
-            bool moved = Math.Abs(originAfter.X - originBefore.X) > 0.001 ||
-                         Math.Abs(originAfter.Y - originBefore.Y) > 0.001 ||
-                         Math.Abs(originAfter.Z - originBefore.Z) > 0.001;
-            if (!moved && angleDeg != 0)
-                lw.WriteLine("  WARNING: origin did not change – component may still be blocked.");
-        }
-
-        // ── Step 4: optionally restore constraints ────────────────────────────
+        // Step 3: optionally restore constraints.
         if (restoreAfter && suppressed.Count > 0)
         {
-            RestoreConstraintTags(suppressed);
+            RestoreConstraints(suppressed);
             lw.WriteLine("  Constraints RESTORED (new position may revert on next update).");
         }
         else if (suppressed.Count > 0)
