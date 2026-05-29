@@ -83,6 +83,39 @@
 //   matching translation) so it rotates about the correct world axis/pivot.
 // * Top-level components (cover, body) are unaffected and move exactly as before.
 //
+// v3.7 changes  (outlet now rotates everything connected to it)
+// ───────────────────────────────────────────────────────────────────────────
+// * Problem: the outlet rotated alone. Anything mounted on it (flanges, gaskets,
+//   pipe stubs, fittings) stayed behind — unlike the cover, which already drags
+//   its vac valve along.
+// * Fix: before the constraints are suppressed, we walk the assembly CONSTRAINT
+//   GRAPH starting from the outlet and collect every component rigidly connected
+//   to it (BFS over the constraints). All of them are then rotated with the same
+//   angle / axis / pivot as the outlet — the outlet's equivalent of the cover +
+//   vac-valve group.
+// * The body, cover and vac valve are excluded from the traversal, so the outlet
+//   rotation can never cross into them or drag the fixed body out of place.
+// * The graph MUST be built before suppression — a suppressed constraint no
+//   longer describes the connection we need to follow.
+//
+// v3.8 changes  (outlet connectivity now works for the NESTED outlet)
+// ───────────────────────────────────────────────────────────────────────────
+// * v3.7 only scanned TOP-LEVEL constraints, so for this assembly — where the
+//   outlet lives inside the body subassembly (see v3.6) — it found nothing and
+//   the outlet still rotated alone.
+// * Fix: the connectivity walk now scans the constraints in the part that
+//   actually positions the outlet among its siblings — its owning subassembly
+//   (Component.Parent.Prototype) as well as the top assembly. Parts it finds
+//   are mapped back to the displayed tree by prototype, then rotated through the
+//   same proven (nested-safe) path that moves the outlet.
+// * The walk stops at the body / cover / vac — by tag AND by name — so it can
+//   never flood into the fixed body shell, even when that shell appears as a
+//   different occurrence inside the subassembly.
+// * Before the (slow) rotation commits, the auto-detected group is listed in a
+//   confirmation box: Yes = outlet + parts, No = outlet only, Cancel = abort.
+//   Every part found (and every stop) is written to the Change Log, so a single
+//   run shows exactly what was detected.
+//
 // Usage: Open an assembly, then run via Tools -> Journal -> Play
 
 using System;
@@ -299,6 +332,198 @@ public class AssemblyRotator
         {
             try { c.Suppressed = false; } catch { }
         }
+    }
+
+
+    // ─── Outlet connectivity (rotate everything attached to the outlet) ─────────
+    // Mirrors the cover behaviour (cover + vac valve), but generalised: starting
+    // from the outlet we walk the assembly constraint graph and collect every
+    // component rigidly connected to it, then rotate them all with the same
+    // angle / axis / pivot. The body, cover and vac valve are excluded so the
+    // traversal can never cross into them or drag them along.
+    //
+    // IMPORTANT: build this graph BEFORE the constraints are suppressed — a
+    // suppressed constraint no longer describes the connection we must follow.
+
+    // Resolve the component that owns a constraint reference's geometry. The
+    // geometry is usually a face/edge inside a component occurrence; for a
+    // component-level reference it is the component itself.
+    static Component CompOfRef(NXOpen.Positioning.ConstraintReference cr)
+    {
+        try
+        {
+            NXObject g = cr.Geometry;
+            if (g == null) return null;
+            Component asComp = g as Component;
+            if (asComp != null) return asComp;
+            return g.OwningComponent;
+        }
+        catch { return null; }
+    }
+
+    static void AddEdge(Dictionary<Tag, List<Tag>> graph, Tag a, Tag b)
+    {
+        if (a == b) return;
+        List<Tag> la;
+        if (!graph.TryGetValue(a, out la)) { la = new List<Tag>(); graph[a] = la; }
+        if (!la.Contains(b)) la.Add(b);
+        List<Tag> lb;
+        if (!graph.TryGetValue(b, out lb)) { lb = new List<Tag>(); graph[b] = lb; }
+        if (!lb.Contains(a)) lb.Add(a);
+    }
+
+    // Build an undirected component graph from every constraint in the part: two
+    // components share an edge if a constraint references geometry in both.
+    static Dictionary<Tag, List<Tag>> BuildConstraintGraph(
+        Part scanPart, Dictionary<Tag, Component> compByTag)
+    {
+        var graph = new Dictionary<Tag, List<Tag>>();
+        int nConstraints = 0;
+        try
+        {
+            UFSession ufs = UFSession.GetUFSession();
+            Tag tag = Tag.Null;
+            ufs.Obj.CycleObjsInPart(scanPart.Tag, -1, ref tag);
+            while (tag != Tag.Null)
+            {
+                NXOpen.Positioning.Constraint c =
+                    NXOpen.Utilities.NXObjectManager.Get(tag) as NXOpen.Positioning.Constraint;
+                if (c != null)
+                {
+                    nConstraints++;
+                    var comps = new List<Component>();
+                    try
+                    {
+                        foreach (NXOpen.Positioning.ConstraintReference cr in c.GetConstraintReferences())
+                        {
+                            Component oc = CompOfRef(cr);
+                            if (oc != null) { comps.Add(oc); compByTag[oc.Tag] = oc; }
+                        }
+                    }
+                    catch { }
+                    for (int i = 0; i < comps.Count; i++)
+                        for (int j = i + 1; j < comps.Count; j++)
+                            AddEdge(graph, comps[i].Tag, comps[j].Tag);
+                }
+                ufs.Obj.CycleObjsInPart(scanPart.Tag, -1, ref tag);
+            }
+        }
+        catch (Exception ex)
+        {
+            AppendLog("Connectivity scan failed: " + ex.Message);
+        }
+        AppendLog("Scanned " + nConstraints + " constraint(s); found " +
+                  graph.Count + " connected component node(s).");
+        return graph;
+    }
+
+    // The part whose constraints position a component among its siblings: for a
+    // top-level component this is the work part; for a nested component it is the
+    // prototype part of its parent subassembly occurrence (where those sibling
+    // constraints are actually authored).
+    static Part OwningAssemblyPart(Part workPart, Component comp)
+    {
+        try
+        {
+            Component parent = comp.Parent;
+            if (parent != null)
+            {
+                Part pp = parent.Prototype as Part;
+                if (pp != null) return pp;
+            }
+        }
+        catch { }
+        return workPart;
+    }
+
+    static Tag TryProtoTag(Component c)
+    {
+        try { Part p = c.Prototype as Part; if (p != null) return p.Tag; }
+        catch { }
+        return Tag.Null;
+    }
+
+    static bool NameExcluded(Component c, List<string> keys)
+    {
+        if (keys == null || keys.Count == 0) return false;
+        string up = GetBestName(c).ToUpper();
+        foreach (string k in keys)
+            if (!string.IsNullOrEmpty(k) && up.Contains(k)) return true;
+        return false;
+    }
+
+    // Map a component found while scanning a subassembly back to the matching
+    // occurrence in the displayed assembly tree (by prototype part), so it can be
+    // rotated through the same proven path that moves the outlet itself.
+    static Component MapToDisplayed(List<CompInfo> allComps, Component c)
+    {
+        Tag pt = TryProtoTag(c);
+        if (pt == Tag.Null) return c;
+        foreach (CompInfo ci in allComps)
+            if (TryProtoTag(ci.Comp) == pt) return ci.Comp;
+        return c;
+    }
+
+    static string SafePartName(Part p)
+    {
+        try { if (p != null) return p.Leaf; } catch { }
+        return "(unknown part)";
+    }
+
+    // Every component constraint-connected to the seed (BFS over the constraint
+    // graph of scanPart). The seed is matched into scanPart's own context by
+    // prototype when its displayed-tree tag is not a node in that part's graph
+    // (i.e. the outlet seen from the top assembly vs. inside its subassembly).
+    // The walk stops at — and never crosses — anything excluded by tag or name
+    // (body / cover / vac), so it cannot flood into the fixed body.
+    static List<Component> CollectConnectedInPart(
+        Part scanPart, Component seed, HashSet<Tag> excludeTags, List<string> excludeNameKeys)
+    {
+        var compByTag = new Dictionary<Tag, Component>();
+        var graph = BuildConstraintGraph(scanPart, compByTag);
+
+        // Resolve the seed node in this part's own context.
+        Tag seedTag = seed.Tag;
+        if (!graph.ContainsKey(seedTag))
+        {
+            Tag protoTag = TryProtoTag(seed);
+            if (protoTag != Tag.Null)
+                foreach (var kv in compByTag)
+                    if (TryProtoTag(kv.Value) == protoTag) { seedTag = kv.Key; break; }
+        }
+
+        var result  = new List<Component>();
+        var visited = new HashSet<Tag>();
+        var queue   = new Queue<Tag>();
+        visited.Add(seedTag);
+        queue.Enqueue(seedTag);
+
+        while (queue.Count > 0)
+        {
+            Tag t = queue.Dequeue();
+            List<Tag> neighbours;
+            if (!graph.TryGetValue(t, out neighbours)) continue;
+            foreach (Tag nt in neighbours)
+            {
+                if (visited.Contains(nt)) continue;
+                visited.Add(nt);                 // seen — do not revisit
+                Component nc;
+                if (!compByTag.TryGetValue(nt, out nc) || nc == null) continue;
+                if (excludeTags.Contains(nt))
+                {
+                    AppendLog("      (stop at " + GetBestName(nc) + " — excluded)");
+                    continue;                    // do not traverse through it
+                }
+                if (NameExcluded(nc, excludeNameKeys))
+                {
+                    AppendLog("      (stop at " + GetBestName(nc) + " — excluded by name)");
+                    continue;
+                }
+                queue.Enqueue(nt);
+                result.Add(nc);
+            }
+        }
+        return result;
     }
 
 
@@ -592,15 +817,15 @@ public class AssemblyRotator
             form.Font, Color.FromArgb(120,80,0), lx, y, 590); y += 24;
 
         // OUTLET  + step angle
-        FL(form, "OUTLET  (will be rotated)",
-            new Font("Segoe UI", 9, FontStyle.Bold), Color.FromArgb(0,130,0), lx, y, 300); y += 20;
+        FL(form, "OUTLET  (rotated with everything connected to it)",
+            new Font("Segoe UI", 9, FontStyle.Bold), Color.FromArgb(0,130,0), lx, y, 400); y += 20;
         ComboBox outletCombo = FC(form, allComps, lx, y, cw,
             autoOutlet >= 0 ? autoOutlet : Math.Min(2, allComps.Count-1)); y += 26;
         FL(form, "Rotation angle:", form.Font, Color.Black, lx, y+3, 100);
         TextBox outletAngleBox = FT(form, "0", lx+105, y, 70);
         FL(form, "Step angle (deg):", form.Font, Color.Black, lx+200, y+3, 110);
         TextBox outletStepBox = FT(form, "", lx+315, y, 70); y += 24;
-        FL(form, "Outlet angle must be a whole multiple of its step angle (its indexed positions).",
+        FL(form, "Multiple of its step angle. All parts constrained to the outlet rotate with it.",
             form.Font, Color.Gray, lx, y, 590); y += 26;
 
         HS(form, lx, y, cw); y += 10;
@@ -727,6 +952,94 @@ public class AssemblyRotator
                 return;
             }
 
+            // Outlet group: collect everything rigidly connected to the outlet
+            // BEFORE the constraints are suppressed (a suppressed constraint no
+            // longer describes the connection). The scan runs in the part that
+            // actually positions the outlet among its siblings — its owning
+            // subassembly when the outlet is nested (this assembly) AND the top
+            // assembly — and the body / cover / vac are excluded by tag AND by
+            // name so the walk can never flood into the fixed body.
+            List<Component> outletFollowers = new List<Component>();
+            if (outletAngle != 0)
+            {
+                Component outletSeed = allComps[outletCombo.SelectedIndex].Comp;
+
+                var excludeTags = new HashSet<Tag>();
+                excludeTags.Add(allComps[bodyCombo.SelectedIndex].Comp.Tag);
+                excludeTags.Add(allComps[coverCombo.SelectedIndex].Comp.Tag);
+                if (vacComp != null) excludeTags.Add(vacComp.Tag);
+
+                var excludeNames = new List<string>();
+                excludeNames.Add("BODY");
+                excludeNames.Add("COVER");
+                if (vacComp != null) { excludeNames.Add("VAC"); excludeNames.Add("VALVE"); }
+
+                // Scan both the top assembly and the outlet's owning subassembly,
+                // wherever the positioning constraints happen to be authored.
+                var raw = new List<Component>();
+                AppendLog("Outlet connectivity scan in '" + SafePartName(workPart) + "' (top level).");
+                raw.AddRange(CollectConnectedInPart(workPart, outletSeed, excludeTags, excludeNames));
+                Part subPart = OwningAssemblyPart(workPart, outletSeed);
+                if (subPart.Tag != workPart.Tag)
+                {
+                    AppendLog("Outlet connectivity scan in '" + SafePartName(subPart) + "' (outlet subassembly).");
+                    raw.AddRange(CollectConnectedInPart(subPart, outletSeed, excludeTags, excludeNames));
+                }
+
+                // Map each connected part back to its occurrence in the displayed
+                // tree (so it rotates through the same proven path as the outlet)
+                // and dedupe by prototype.
+                var seenProto = new HashSet<Tag>();
+                foreach (Component rc in raw)
+                {
+                    Component disp = MapToDisplayed(allComps, rc);
+                    if (disp == null || disp.Tag == outletSeed.Tag) continue;
+                    Tag pkey = TryProtoTag(disp);
+                    if (pkey != Tag.Null && !seenProto.Add(pkey)) continue;
+                    outletFollowers.Add(disp);
+                }
+
+                AppendLog("Outlet connectivity: " + outletFollowers.Count +
+                          " connected part(s) will rotate with the outlet.");
+                foreach (Component f in outletFollowers)
+                    AppendLog("      + " + GetBestName(f));
+                if (outletFollowers.Count == 0)
+                    AppendLog("      (nothing constraint-linked to the outlet was found; only the outlet moves.)");
+
+                // Confirm the auto-detected group before the slow rotation commits.
+                if (outletFollowers.Count > 0)
+                {
+                    var sb = new System.Text.StringBuilder();
+                    sb.AppendLine("These " + outletFollowers.Count +
+                                  " part(s) are connected to the outlet and will rotate WITH it:");
+                    sb.AppendLine();
+                    foreach (Component f in outletFollowers) sb.AppendLine("    • " + GetBestName(f));
+                    sb.AppendLine();
+                    sb.AppendLine("Yes     = rotate the outlet AND these parts");
+                    sb.AppendLine("No      = rotate the outlet ONLY");
+                    sb.AppendLine("Cancel  = do not rotate the outlet at all");
+                    DialogResult ans = MessageBox.Show(sb.ToString(), "Confirm outlet group",
+                        MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+                    if (ans == DialogResult.Cancel)
+                    {
+                        outletAngle = 0; outletFollowers.Clear();
+                        AppendLog("Outlet rotation cancelled by user.");
+                    }
+                    else if (ans == DialogResult.No)
+                    {
+                        outletFollowers.Clear();
+                        AppendLog("Rotating outlet only (connected parts skipped by user).");
+                    }
+                }
+            }
+
+            // After an outlet-only cancel there may be nothing left to rotate.
+            if (coverAngle == 0 && outletAngle == 0)
+            {
+                AppendLog("Nothing to rotate.");
+                return;
+            }
+
             // Suppress constraints ONCE for the whole action (not per move) so
             // the solver cannot revert anything and we avoid hammering the model.
             var suppressed = SuppressAllConstraints(workPart);
@@ -772,6 +1085,19 @@ public class AssemblyRotator
                     RotationOp op = MakeOp(outletComp, outletAngle, axis, pivot);
                     newOps.Add(op); applied.Add(op.Description);
                     AppendLog("APPLY  " + op.Description);
+
+                    // Everything connected to the outlet follows it with the same
+                    // angle / axis / pivot (the outlet's equivalent of cover + vac).
+                    foreach (Component f in outletFollowers)
+                    {
+                        if (f == outletComp) continue;
+                        if (MoveAround(workPart, f, outletAngle, axis, pivot, "Rotate outlet-attached part"))
+                        {
+                            RotationOp fop = MakeOp(f, outletAngle, axis, pivot);
+                            newOps.Add(fop); applied.Add(fop.Description + "  [with outlet]");
+                            AppendLog("APPLY  " + fop.Description + "  [with outlet]");
+                        }
+                    }
                 }
             }
 
