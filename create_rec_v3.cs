@@ -46,12 +46,17 @@ public class AssemblyRotator
         public string TreeDisplay;
     }
 
+    // One row of the Bill of Materials: a unique part and every instance of it.
+    class BomItem
+    {
+        public string PartName;
+        public int Quantity;
+        public int MinLevel = int.MaxValue;
+        public List<Component> Instances = new List<Component>();
+    }
+
     public static void Main(string[] args)
     {
-        lw.Open();
-        lw.WriteLine("=== Assembly Component Rotator v3 ===");
-        lw.WriteLine("");
-
         Part workPart = theSession.Parts.Work;
         if (workPart == null)
         {
@@ -78,20 +83,6 @@ public class AssemblyRotator
             return;
         }
 
-        // Print tree
-        lw.WriteLine("Assembly Tree:");
-        lw.WriteLine("─────────────────────────────────────────────");
-        lw.WriteLine("  [ROOT] " + GetBestName(rootComp));
-        foreach (CompInfo ci in allComps)
-        {
-            string indent = new string(' ', (ci.Level + 1) * 4);
-            string prefix = ci.Comp.GetChildren().Length > 0 ? "[ASM]" : "[PRT]";
-            lw.WriteLine(indent + prefix + " " + ci.FullName);
-        }
-        lw.WriteLine("─────────────────────────────────────────────");
-        lw.WriteLine("Found " + allComps.Count + " components");
-        lw.WriteLine("");
-
         // Auto-detect body / cover / outlet by name
         int autoBody = -1, autoCover = -1, autoOutlet = -1;
         for (int i = 0; i < allComps.Count; i++)
@@ -105,15 +96,7 @@ public class AssemblyRotator
         // Auto-read body origin to pre-fill pivot
         Point3d defaultPivot = new Point3d(0, 0, 0);
         if (autoBody >= 0)
-        {
             defaultPivot = TryGetComponentOrigin(allComps[autoBody].Comp);
-            lw.WriteLine("Auto-pivot (body origin): (" +
-                defaultPivot.X.ToString("F3") + ", " +
-                defaultPivot.Y.ToString("F3") + ", " +
-                defaultPivot.Z.ToString("F3") + ")");
-            lw.WriteLine("  (If this looks wrong, override X/Y/Z in the dialog)");
-            lw.WriteLine("");
-        }
 
         int bodyIdx, coverIdx, outletIdx;
         double coverAngle, outletAngle;
@@ -402,7 +385,20 @@ public class AssemblyRotator
 
         // Header
         FL(form, "ASSEMBLY COMPONENT ROTATOR  v3",
-            new Font("Segoe UI", 11, FontStyle.Bold), Color.FromArgb(0,90,158), lx, y, 550); y += 28;
+            new Font("Segoe UI", 11, FontStyle.Bold), Color.FromArgb(0,90,158), lx, y, 420);
+
+        // BOM button – the BOM stays closed and only opens when this is clicked.
+        Button bomBtn = new Button();
+        bomBtn.Text = "Show BOM";
+        bomBtn.Font = new Font("Segoe UI", 9, FontStyle.Bold);
+        bomBtn.Left = 455; bomBtn.Top = y - 2; bomBtn.Width = 140; bomBtn.Height = 28;
+        bomBtn.FlatStyle = FlatStyle.Flat;
+        bomBtn.BackColor = Color.FromArgb(0,120,215); bomBtn.ForeColor = Color.White;
+        bomBtn.FlatAppearance.BorderSize = 0;
+        bomBtn.Click += delegate { ShowBomDialog(allComps); };
+        form.Controls.Add(bomBtn);
+        bomBtn.BringToFront();
+        y += 28;
         FL(form, "Constraints are suppressed before rotating and LEFT suppressed to hold position.",
             form.Font, Color.Gray, lx, y, 570); y += 28;
         HS(form, lx, y, cw); y += 12;
@@ -502,6 +498,238 @@ public class AssemblyRotator
 
         form.Dispose();
         return true;
+    }
+
+
+    // ─── Bill of Materials (BOM) ──────────────────────────────────────────────
+    // Closed by default – the BOM window only opens from the "Show BOM" button.
+    // It lists unique parts with quantity + level, lets the user show/hide
+    // (blank/unblank) components in the NX view, and export the BOM.
+
+    // Grouping key: prefer the prototype part leaf name so identical parts merge.
+    static string GetGroupKey(Component comp)
+    {
+        try
+        {
+            Part proto = comp.Prototype as Part;
+            if (proto != null)
+            {
+                string leaf = proto.Leaf;
+                if (!string.IsNullOrEmpty(leaf)) return leaf.ToUpper();
+            }
+        }
+        catch { }
+        return GetBestName(comp).ToUpper();
+    }
+
+    static List<BomItem> BuildBom(List<CompInfo> allComps)
+    {
+        var map = new Dictionary<string, BomItem>();
+        var order = new List<string>();
+        foreach (CompInfo ci in allComps)
+        {
+            string key = GetGroupKey(ci.Comp);
+            BomItem item;
+            if (!map.TryGetValue(key, out item))
+            {
+                item = new BomItem();
+                item.PartName = ci.FullName;
+                map[key] = item;
+                order.Add(key);
+            }
+            item.Quantity++;
+            item.Instances.Add(ci.Comp);
+            if (ci.Level < item.MinLevel) item.MinLevel = ci.Level;
+        }
+        var list = new List<BomItem>();
+        foreach (string k in order) list.Add(map[k]);
+        return list;
+    }
+
+    static void ShowBomDialog(List<CompInfo> allComps)
+    {
+        List<BomItem> bom = BuildBom(allComps);
+
+        Form f = new Form();
+        f.Text = "Bill of Materials";
+        f.Width = 650; f.Height = 580;
+        f.StartPosition = FormStartPosition.CenterScreen;
+        f.TopMost = true;
+        f.FormBorderStyle = FormBorderStyle.FixedDialog;
+        f.MaximizeBox = false; f.MinimizeBox = false;
+        f.BackColor = Color.White;
+        f.Font = new Font("Segoe UI", 9);
+
+        FL(f, "BILL OF MATERIALS",
+            new Font("Segoe UI", 11, FontStyle.Bold), Color.FromArgb(0,90,158), 15, 12, 500);
+        FL(f, "Select one or more rows, then Show / Hide to blank/unblank those components.",
+            f.Font, Color.Gray, 15, 36, 600);
+
+        ListView lv = new ListView();
+        lv.Left = 15; lv.Top = 60; lv.Width = 605; lv.Height = 390;
+        lv.View = System.Windows.Forms.View.Details;
+        lv.FullRowSelect = true;
+        lv.GridLines = true;
+        lv.MultiSelect = true;
+        lv.HideSelection = false;
+        lv.Font = new Font("Consolas", 9);
+        lv.Columns.Add("#", 40);
+        lv.Columns.Add("Part Name", 405);
+        lv.Columns.Add("Qty", 60);
+        lv.Columns.Add("Level", 80);
+
+        int n = 1;
+        foreach (BomItem bi in bom)
+        {
+            ListViewItem lvi = new ListViewItem(n.ToString());
+            lvi.SubItems.Add(bi.PartName);
+            lvi.SubItems.Add(bi.Quantity.ToString());
+            lvi.SubItems.Add(bi.MinLevel == int.MaxValue ? "-" : bi.MinLevel.ToString());
+            lvi.Tag = bi;
+            lv.Items.Add(lvi);
+            n++;
+        }
+        f.Controls.Add(lv);
+
+        int by = 462;
+        Button showSel = MkBtn(f, "Show Selected", 15,  by, 120);
+        Button hideSel = MkBtn(f, "Hide Selected", 143, by, 120);
+        Button showAll = MkBtn(f, "Show All",      271, by, 95);
+        Button hideAll = MkBtn(f, "Hide All",      374, by, 95);
+        Button export  = MkBtn(f, "Export...",     500, by, 120);
+        Button close   = MkBtn(f, "Close",         500, by + 40, 120);
+
+        showSel.Click += delegate { SetBomVisibility(GetSelectedBom(lv), true);  };
+        hideSel.Click += delegate { SetBomVisibility(GetSelectedBom(lv), false); };
+        showAll.Click += delegate { SetBomVisibility(bom, true);  };
+        hideAll.Click += delegate { SetBomVisibility(bom, false); };
+        export.Click  += delegate { ExportBom(bom); };
+        close.Click   += delegate { f.Close(); };
+
+        f.ShowDialog();
+        f.Dispose();
+    }
+
+    static List<BomItem> GetSelectedBom(ListView lv)
+    {
+        var sel = new List<BomItem>();
+        foreach (ListViewItem lvi in lv.SelectedItems)
+        {
+            BomItem bi = lvi.Tag as BomItem;
+            if (bi != null) sel.Add(bi);
+        }
+        if (sel.Count == 0)
+            MessageBox.Show("Select one or more BOM rows first.",
+                "No selection", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        return sel;
+    }
+
+    // Show = unblank, Hide = blank.  Uses UF SetBlankStatus on each component tag.
+    static void SetBomVisibility(List<BomItem> items, bool show)
+    {
+        if (items == null || items.Count == 0) return;
+        int cnt = 0;
+        try
+        {
+            UFSession ufs = UFSession.GetUFSession();
+            int status = show ? UFConstants.UF_OBJ_NOT_BLANKED : UFConstants.UF_OBJ_BLANKED;
+            foreach (BomItem bi in items)
+                foreach (Component c in bi.Instances)
+                {
+                    try { ufs.Obj.SetBlankStatus(c.Tag, status); cnt++; }
+                    catch { }
+                }
+        }
+        catch (Exception ex)
+        {
+            lw.WriteLine("  BOM visibility error: " + ex.Message);
+        }
+        lw.WriteLine("  BOM " + (show ? "SHOW" : "HIDE") +
+                     ": updated " + cnt + " component(s).");
+    }
+
+    static void ExportBom(List<BomItem> bom)
+    {
+        lw.Open();
+        lw.WriteLine("");
+        lw.WriteLine("=== BILL OF MATERIALS ===");
+        string header = string.Format("{0,-4} {1,-48} {2,5} {3,6}", "#", "Part Name", "Qty", "Level");
+        lw.WriteLine(header);
+        lw.WriteLine(new string('-', 66));
+
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("Bill of Materials");
+        sb.AppendLine(header);
+
+        int n = 1, total = 0;
+        foreach (BomItem bi in bom)
+        {
+            string lvl = bi.MinLevel == int.MaxValue ? "-" : bi.MinLevel.ToString();
+            string line = string.Format("{0,-4} {1,-48} {2,5} {3,6}",
+                n, Trunc(bi.PartName, 48), bi.Quantity, lvl);
+            lw.WriteLine(line);
+            sb.AppendLine(line);
+            total += bi.Quantity; n++;
+        }
+        lw.WriteLine(new string('-', 66));
+        string summary = "Unique parts: " + bom.Count + "   Total components: " + total;
+        lw.WriteLine(summary);
+        lw.WriteLine("");
+        sb.AppendLine(summary);
+
+        try
+        {
+            SaveFileDialog sfd = new SaveFileDialog();
+            sfd.Filter = "Text file (*.txt)|*.txt|CSV file (*.csv)|*.csv";
+            sfd.FileName = "BOM.txt";
+            sfd.Title = "Save Bill of Materials";
+            if (sfd.ShowDialog() == DialogResult.OK)
+            {
+                string ext = System.IO.Path.GetExtension(sfd.FileName).ToLower();
+                if (ext == ".csv")
+                    System.IO.File.WriteAllText(sfd.FileName, BomToCsv(bom));
+                else
+                    System.IO.File.WriteAllText(sfd.FileName, sb.ToString());
+                lw.WriteLine("BOM saved to: " + sfd.FileName);
+            }
+            sfd.Dispose();
+        }
+        catch (Exception ex)
+        {
+            lw.WriteLine("  BOM file save failed: " + ex.Message);
+        }
+    }
+
+    static string BomToCsv(List<BomItem> bom)
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("Index,Part Name,Quantity,Level");
+        int n = 1;
+        foreach (BomItem bi in bom)
+        {
+            string lvl = bi.MinLevel == int.MaxValue ? "" : bi.MinLevel.ToString();
+            string nameCsv = "\"" + (bi.PartName ?? "").Replace("\"", "\"\"") + "\"";
+            sb.AppendLine(n + "," + nameCsv + "," + bi.Quantity + "," + lvl);
+            n++;
+        }
+        return sb.ToString();
+    }
+
+    static string Trunc(string s, int n)
+    {
+        if (string.IsNullOrEmpty(s)) return "";
+        return s.Length <= n ? s : s.Substring(0, n - 1) + "~";
+    }
+
+    static Button MkBtn(Form f, string text, int x, int y, int w)
+    {
+        Button b = new Button();
+        b.Text = text; b.Left = x; b.Top = y; b.Width = w; b.Height = 32;
+        b.FlatStyle = FlatStyle.Flat;
+        b.FlatAppearance.BorderColor = Color.FromArgb(180,180,180);
+        b.BackColor = Color.FromArgb(245,245,245);
+        f.Controls.Add(b);
+        return b;
     }
 
 
