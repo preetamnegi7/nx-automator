@@ -25,13 +25,22 @@
 // ──────────────────────────
 // * "Apply Rotation" no longer closes the macro. The dialog stays open so you
 //   can apply many rotations in one session.
-// * Every rotation is recorded as an operation in a Change Log:
-//     - a live log panel inside the dialog updates after each action, and
-//     - a message block pops up after each Apply summarising what changed.
+// * Every rotation is recorded as an operation in a Change Log shown live in the
+//   dialog, plus a message block pops up after each Apply summarising what changed.
 // * Undo / Redo buttons walk an operation stack and re-apply the inverse /
-//   original rotation (delta + matrix) so positions can be stepped back and
-//   forward without re-running the macro.
+//   original rotation so positions can be stepped back and forward.
 // * The only thing that ends the session is the Close button.
+//
+// v3.2 changes
+// ────────────
+// * Single log only: the NX Listing/Information window is no longer used; the
+//   in-dialog Change Log is the one and only log.
+// * Vac valve follows the cover: the part mounted in the cover's port (auto
+//   detected by name, shown in its own selector) is rotated together with the
+//   cover using the same angle/axis/pivot, so it no longer stays behind.
+// * Cover step angle: the cover's rotation must be a whole multiple of a
+//   user-supplied step angle (its indexed positions), so it cannot be driven to
+//   a position that is not physically feasible.
 //
 // Usage: Open an assembly, then run via Tools -> Journal -> Play
 
@@ -47,7 +56,9 @@ public class AssemblyRotator
 {
     static Session theSession = Session.GetSession();
     static UI theUI = UI.GetUI();
-    static ListingWindow lw = theSession.ListingWindow;
+
+    // The single change log. All messages go here (no NX Listing Window).
+    static TextBox _logBox;
 
     class CompInfo
     {
@@ -107,14 +118,15 @@ public class AssemblyRotator
             return;
         }
 
-        // Auto-detect body / cover / outlet by name
-        int autoBody = -1, autoCover = -1, autoOutlet = -1;
+        // Auto-detect body / cover / outlet / vac-valve by name
+        int autoBody = -1, autoCover = -1, autoOutlet = -1, autoVac = -1;
         for (int i = 0; i < allComps.Count; i++)
         {
             string up = allComps[i].FullName.ToUpper();
             if (autoBody   < 0 && up.Contains("BODY")   && !up.Contains("COVER")) autoBody   = i;
             if (autoCover  < 0 && up.Contains("COVER"))                             autoCover  = i;
             if (autoOutlet < 0 && up.Contains("OUTLET"))                            autoOutlet = i;
+            if (autoVac    < 0 && (up.Contains("VAC") || up.Contains("VALVE")))     autoVac    = i;
         }
 
         // Auto-read body origin to pre-fill pivot
@@ -122,15 +134,10 @@ public class AssemblyRotator
         if (autoBody >= 0)
             defaultPivot = TryGetComponentOrigin(allComps[autoBody].Comp);
 
-        lw.Open();
-        lw.WriteLine("=== Assembly Component Rotator v3 (interactive) ===");
-
         // Single interactive dialog drives the whole session: apply, undo,
         // redo and the change log all live inside it. It only returns when
         // the user clicks Close.
-        RunRotatorDialog(workPart, allComps, autoBody, autoCover, autoOutlet, defaultPivot);
-
-        lw.WriteLine("=== Session ended ===");
+        RunRotatorDialog(workPart, allComps, autoBody, autoCover, autoOutlet, autoVac, defaultPivot);
     }
 
 
@@ -206,7 +213,6 @@ public class AssemblyRotator
     static List<NXOpen.Positioning.Constraint> SuppressAllConstraints(Part workPart)
     {
         var suppressed = new List<NXOpen.Positioning.Constraint>();
-        int scanned = 0;
         try
         {
             UFSession ufs = UFSession.GetUFSession();
@@ -214,7 +220,6 @@ public class AssemblyRotator
             ufs.Obj.CycleObjsInPart(workPart.Tag, -1, ref tag);
             while (tag != Tag.Null)
             {
-                scanned++;
                 try
                 {
                     NXOpen.Positioning.Constraint c =
@@ -231,10 +236,8 @@ public class AssemblyRotator
         }
         catch (Exception ex)
         {
-            lw.WriteLine("  Warning: CycleObjsInPart failed: " + ex.Message);
+            AppendLog("Warning: constraint scan failed: " + ex.Message);
         }
-        lw.WriteLine("  Objects scanned: " + scanned +
-                     "  |  Suppressed: " + suppressed.Count);
         return suppressed;
     }
 
@@ -261,7 +264,7 @@ public class AssemblyRotator
         if (restoreAfter && suppressed.Count > 0)
         {
             RestoreConstraints(suppressed);
-            lw.WriteLine("  Constraints RESTORED (new position may revert on next update).");
+            AppendLog("Constraints RESTORED (position may revert on next update).");
         }
 
         RotationOp op = new RotationOp();
@@ -287,11 +290,10 @@ public class AssemblyRotator
         try
         {
             workPart.ComponentAssembly.MoveComponent(comp, delta, ToNXMatrix(dR));
-            lw.WriteLine("  MoveComponent: OK  (" + angleDeg + " deg about " + axis + ")");
         }
         catch (Exception ex)
         {
-            lw.WriteLine("  MoveComponent failed: " + ex.Message);
+            AppendLog("MoveComponent failed: " + ex.Message);
             MessageBox.Show("MoveComponent failed: " + ex.Message,
                 "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
@@ -366,7 +368,7 @@ public class AssemblyRotator
     // Redo step the operation stack; Close ends the session.
 
     static void RunRotatorDialog(Part workPart, List<CompInfo> allComps,
-        int autoBody, int autoCover, int autoOutlet, Point3d defaultPivot)
+        int autoBody, int autoCover, int autoOutlet, int autoVac, Point3d defaultPivot)
     {
         var history = new List<RotationOp>();   // applied ops (undo stack)
         var redo    = new List<RotationOp>();   // undone ops (redo stack)
@@ -408,23 +410,38 @@ public class AssemblyRotator
         FL(form, "BODY  (fixed – will NOT move)",
             new Font("Segoe UI", 9, FontStyle.Bold), Color.FromArgb(0,100,200), lx, y, 400); y += 20;
         ComboBox bodyCombo = FC(form, allComps, lx, y, cw,
-            autoBody >= 0 ? autoBody : 0); y += 32;
+            autoBody >= 0 ? autoBody : 0); y += 30;
 
-        // COVER
+        // COVER  + step angle
         FL(form, "COVER  (will be rotated)",
             new Font("Segoe UI", 9, FontStyle.Bold), Color.FromArgb(180,0,0), lx, y, 300); y += 20;
         ComboBox coverCombo = FC(form, allComps, lx, y, cw,
             autoCover >= 0 ? autoCover : Math.Min(1, allComps.Count-1)); y += 26;
-        FL(form, "Rotation angle:", form.Font, Color.Black, lx, y+3, 110);
-        TextBox coverAngleBox = FT(form, "0", lx+115, y, 80); y += 34;
+        FL(form, "Rotation angle:", form.Font, Color.Black, lx, y+3, 100);
+        TextBox coverAngleBox = FT(form, "0", lx+105, y, 70);
+        FL(form, "Step angle (deg):", form.Font, Color.Black, lx+200, y+3, 110);
+        TextBox stepBox = FT(form, "", lx+315, y, 70); y += 24;
+        FL(form, "Cover angle must be a whole multiple of the step angle (its indexed positions).",
+            form.Font, Color.Gray, lx, y, 590); y += 26;
+
+        // VAC VALVE (rotates with cover)
+        FL(form, "VAC VALVE  (rotates together with COVER)",
+            new Font("Segoe UI", 9, FontStyle.Bold), Color.FromArgb(120,80,0), lx, y, 420); y += 20;
+        ComboBox vacCombo = FC(form, allComps, lx, y, cw,
+            autoVac >= 0 ? autoVac : 0); y += 26;
+        CheckBox vacChk = new CheckBox();
+        vacChk.Text = "Rotate this part together with the cover (same angle / axis / pivot)";
+        vacChk.Left = lx; vacChk.Top = y; vacChk.Width = 590;
+        vacChk.Checked = (autoVac >= 0);
+        form.Controls.Add(vacChk); y += 28;
 
         // OUTLET
         FL(form, "OUTLET  (will be rotated)",
             new Font("Segoe UI", 9, FontStyle.Bold), Color.FromArgb(0,130,0), lx, y, 300); y += 20;
         ComboBox outletCombo = FC(form, allComps, lx, y, cw,
             autoOutlet >= 0 ? autoOutlet : Math.Min(2, allComps.Count-1)); y += 26;
-        FL(form, "Rotation angle:", form.Font, Color.Black, lx, y+3, 110);
-        TextBox outletAngleBox = FT(form, "0", lx+115, y, 80); y += 34;
+        FL(form, "Rotation angle:", form.Font, Color.Black, lx, y+3, 100);
+        TextBox outletAngleBox = FT(form, "0", lx+105, y, 70); y += 32;
 
         HS(form, lx, y, cw); y += 10;
 
@@ -434,8 +451,6 @@ public class AssemblyRotator
         RadioButton radioX = FR(form, "X-Axis",           false, 290, y, 100);
         RadioButton radioY = FR(form, "Y-Axis",           false, 400, y, 100);
         y += 32;
-
-        HS(form, lx, y, cw); y += 10;
 
         // Pivot
         FL(form, "Rotation Axis Point  (auto-detected from body – override if wrong):",
@@ -498,7 +513,7 @@ public class AssemblyRotator
         form.Controls.Add(closeBtn);
         y += 48;
 
-        // Change-log panel
+        // Change-log panel (the one and only log)
         FL(form, "Change Log:", new Font("Segoe UI", 9, FontStyle.Bold), Color.Black, lx, y, 200); y += 20;
         TextBox logBox = new TextBox();
         logBox.Multiline = true; logBox.ReadOnly = true;
@@ -508,6 +523,7 @@ public class AssemblyRotator
         logBox.Left = lx; logBox.Top = y; logBox.Width = cw; logBox.Height = 150;
         form.Controls.Add(logBox);
         y += 158;
+        _logBox = logBox;
 
         form.Height = y + 50;
         form.AcceptButton = applyBtn;   // Enter applies (does not close)
@@ -530,26 +546,68 @@ public class AssemblyRotator
             double.TryParse(pivZ.Text, out pz2);
             Point3d pivot = new Point3d(px2, py2, pz2);
 
-            double coverAngle, outletAngle;
+            double coverAngle, outletAngle, step;
             if (!double.TryParse(coverAngleBox.Text,  out coverAngle))  coverAngle  = 0;
             if (!double.TryParse(outletAngleBox.Text, out outletAngle)) outletAngle = 0;
+            if (!double.TryParse(stepBox.Text,        out step))        step        = 0;
 
             bool restore = restoreChk.Checked;
 
-            var applied = new List<string>();
+            // Cover step-angle enforcement: the cover only has discrete indexed
+            // positions, so its rotation must be a whole multiple of the step.
             if (coverAngle != 0)
             {
-                RotationOp op = ApplyOneRotation(workPart,
-                    allComps[coverCombo.SelectedIndex].Comp, coverAngle, axis, pivot, restore);
-                history.Add(op); applied.Add(op.Description);
-                AppendLog(logBox, "APPLY  " + op.Description);
+                if (step <= 0)
+                {
+                    MessageBox.Show(
+                        "Enter the COVER step angle first.\n\n" +
+                        "The cover has indexed / stepped positions, so its rotation must be a " +
+                        "whole multiple of the step angle. This prevents moving it to a position " +
+                        "that is not physically feasible.",
+                        "Step angle required", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+                double ratio = coverAngle / step;
+                double nearest = Math.Round(ratio);
+                if (Math.Abs(coverAngle - nearest * step) > 0.001)
+                {
+                    double low  = Math.Floor(ratio)   * step;
+                    double high = Math.Ceiling(ratio)  * step;
+                    MessageBox.Show(
+                        "Cover angle " + coverAngle + "° is not a multiple of the step angle " +
+                        step + "°.\n\nNearest feasible values: " + low + "° or " + high + "°.",
+                        "Invalid cover angle", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
             }
+
+            var applied = new List<string>();
+
+            if (coverAngle != 0)
+            {
+                int coverIdx = coverCombo.SelectedIndex;
+                RotationOp op = ApplyOneRotation(workPart,
+                    allComps[coverIdx].Comp, coverAngle, axis, pivot, restore);
+                history.Add(op); applied.Add(op.Description);
+                AppendLog("APPLY  " + op.Description);
+
+                // Vac valve follows the cover: same angle / axis / pivot.
+                int vacIdx = vacCombo.SelectedIndex;
+                if (vacChk.Checked && vacIdx >= 0 && vacIdx != coverIdx)
+                {
+                    RotationOp vop = ApplyOneRotation(workPart,
+                        allComps[vacIdx].Comp, coverAngle, axis, pivot, restore);
+                    history.Add(vop); applied.Add(vop.Description + "  [with cover]");
+                    AppendLog("APPLY  " + vop.Description + "  [with cover]");
+                }
+            }
+
             if (outletAngle != 0)
             {
                 RotationOp op = ApplyOneRotation(workPart,
                     allComps[outletCombo.SelectedIndex].Comp, outletAngle, axis, pivot, restore);
                 history.Add(op); applied.Add(op.Description);
-                AppendLog(logBox, "APPLY  " + op.Description);
+                AppendLog("APPLY  " + op.Description);
             }
 
             if (applied.Count == 0)
@@ -577,7 +635,7 @@ public class AssemblyRotator
             history.RemoveAt(history.Count - 1);
             DoMove(workPart, op.Comp, -op.AngleDeg, op.Axis, op.Pivot, true);
             redo.Add(op);
-            AppendLog(logBox, "UNDO   " + op.Description);
+            AppendLog("UNDO   " + op.Description);
             refreshButtons();
         };
 
@@ -588,30 +646,27 @@ public class AssemblyRotator
             redo.RemoveAt(redo.Count - 1);
             DoMove(workPart, op.Comp, op.AngleDeg, op.Axis, op.Pivot, true);
             history.Add(op);
-            AppendLog(logBox, "REDO   " + op.Description);
+            AppendLog("REDO   " + op.Description);
             refreshButtons();
         };
 
         refreshButtons();
-        AppendLog(logBox, "Ready. Set angles and click Apply Rotation.");
+        AppendLog("Ready. Set angles and click Apply Rotation.");
 
         form.ShowDialog();
+        AppendLog("Session ended: " + history.Count + " net operation(s) applied.");
+        _logBox = null;
         form.Dispose();
-
-        lw.WriteLine("");
-        lw.WriteLine("=== Session summary: " + history.Count +
-                     " net operation(s) applied ===");
     }
 
-    // Append one timestamped line to the live log panel and mirror it to the
-    // NX Listing Window.
-    static void AppendLog(TextBox box, string line)
+    // Append one timestamped line to the single change-log panel.
+    static void AppendLog(string line)
     {
+        if (_logBox == null) return;
         string stamp = DateTime.Now.ToString("HH:mm:ss");
-        box.AppendText(stamp + "  " + line + Environment.NewLine);
-        box.SelectionStart = box.TextLength;
-        box.ScrollToCaret();
-        lw.WriteLine(stamp + "  " + line);
+        _logBox.AppendText(stamp + "  " + line + Environment.NewLine);
+        _logBox.SelectionStart = _logBox.TextLength;
+        _logBox.ScrollToCaret();
     }
 
 
@@ -756,21 +811,14 @@ public class AssemblyRotator
         }
         catch (Exception ex)
         {
-            lw.WriteLine("  BOM visibility error: " + ex.Message);
+            AppendLog("BOM visibility error: " + ex.Message);
         }
-        lw.WriteLine("  BOM " + (show ? "SHOW" : "HIDE") +
-                     ": updated " + cnt + " component(s).");
+        AppendLog("BOM " + (show ? "SHOW" : "HIDE") + ": updated " + cnt + " component(s).");
     }
 
     static void ExportBom(List<BomItem> bom)
     {
-        lw.Open();
-        lw.WriteLine("");
-        lw.WriteLine("=== BILL OF MATERIALS ===");
         string header = string.Format("{0,-4} {1,-48} {2,5} {3,6}", "#", "Part Name", "Qty", "Level");
-        lw.WriteLine(header);
-        lw.WriteLine(new string('-', 66));
-
         var sb = new System.Text.StringBuilder();
         sb.AppendLine("Bill of Materials");
         sb.AppendLine(header);
@@ -781,14 +829,10 @@ public class AssemblyRotator
             string lvl = bi.MinLevel == int.MaxValue ? "-" : bi.MinLevel.ToString();
             string line = string.Format("{0,-4} {1,-48} {2,5} {3,6}",
                 n, Trunc(bi.PartName, 48), bi.Quantity, lvl);
-            lw.WriteLine(line);
             sb.AppendLine(line);
             total += bi.Quantity; n++;
         }
-        lw.WriteLine(new string('-', 66));
         string summary = "Unique parts: " + bom.Count + "   Total components: " + total;
-        lw.WriteLine(summary);
-        lw.WriteLine("");
         sb.AppendLine(summary);
 
         try
@@ -804,14 +848,17 @@ public class AssemblyRotator
                     System.IO.File.WriteAllText(sfd.FileName, BomToCsv(bom));
                 else
                     System.IO.File.WriteAllText(sfd.FileName, sb.ToString());
-                lw.WriteLine("BOM saved to: " + sfd.FileName);
+                AppendLog("BOM saved to: " + sfd.FileName);
             }
             sfd.Dispose();
         }
         catch (Exception ex)
         {
-            lw.WriteLine("  BOM file save failed: " + ex.Message);
+            AppendLog("BOM file save failed: " + ex.Message);
         }
+
+        MessageBox.Show(summary, "Bill of Materials",
+            MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
     static string BomToCsv(List<BomItem> bom)
