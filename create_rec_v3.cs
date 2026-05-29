@@ -36,11 +36,21 @@
 // * Single log only: the NX Listing/Information window is no longer used; the
 //   in-dialog Change Log is the one and only log.
 // * Vac valve follows the cover: the part mounted in the cover's port (auto
-//   detected by name, shown in its own selector) is rotated together with the
-//   cover using the same angle/axis/pivot, so it no longer stays behind.
+//   detected by name) is rotated together with the cover using the same
+//   angle/axis/pivot, so it no longer stays behind.
 // * Cover step angle: the cover's rotation must be a whole multiple of a
 //   user-supplied step angle (its indexed positions), so it cannot be driven to
 //   a position that is not physically feasible.
+//
+// v3.3 changes
+// ────────────
+// * Body reference lock: the body is captured at its home placement and forced
+//   back to it after every operation, so it can never be dragged out of its
+//   fixed reference position when the cover or outlet is rotated.
+// * Outlet auto-detect no longer collides with the body subassembly (a name
+//   like "Body Assembly - Straight Outlet" no longer auto-selects as outlet).
+// * Vac valve is mandatory and no longer a configurable option: it is auto
+//   detected and always rotates with the cover (shown read-only for reference).
 //
 // Usage: Open an assembly, then run via Tools -> Journal -> Play
 
@@ -59,6 +69,14 @@ public class AssemblyRotator
 
     // The single change log. All messages go here (no NX Listing Window).
     static TextBox _logBox;
+
+    // Body reference lock: the body must ALWAYS stay in its reference position.
+    // We remember its home placement and restore it after every operation so a
+    // constraint can never drag it out of place when another part is rotated.
+    static Component _bodyComp;
+    static Point3d   _bodyHomeOrigin;
+    static Matrix3x3 _bodyHomeMatrix;
+    static bool      _bodyHomeSet;
 
     class CompInfo
     {
@@ -125,7 +143,9 @@ public class AssemblyRotator
             string up = allComps[i].FullName.ToUpper();
             if (autoBody   < 0 && up.Contains("BODY")   && !up.Contains("COVER")) autoBody   = i;
             if (autoCover  < 0 && up.Contains("COVER"))                             autoCover  = i;
-            if (autoOutlet < 0 && up.Contains("OUTLET"))                            autoOutlet = i;
+            // Outlet must not match the body subassembly (e.g. "Body Assembly -
+            // Straight Outlet" contains both BODY and OUTLET).
+            if (autoOutlet < 0 && up.Contains("OUTLET") && !up.Contains("BODY") && i != autoBody) autoOutlet = i;
             if (autoVac    < 0 && (up.Contains("VAC") || up.Contains("VALVE")))     autoVac    = i;
         }
 
@@ -406,11 +426,17 @@ public class AssemblyRotator
             form.Font, Color.Gray, lx, y, 590); y += 24;
         HS(form, lx, y, cw); y += 10;
 
-        // BODY
-        FL(form, "BODY  (fixed – will NOT move)",
-            new Font("Segoe UI", 9, FontStyle.Bold), Color.FromArgb(0,100,200), lx, y, 400); y += 20;
+        // BODY  (fixed reference – held in place, never moves)
+        FL(form, "BODY  (fixed reference – held in place, will NOT move)",
+            new Font("Segoe UI", 9, FontStyle.Bold), Color.FromArgb(0,100,200), lx, y, 460); y += 20;
         ComboBox bodyCombo = FC(form, allComps, lx, y, cw,
             autoBody >= 0 ? autoBody : 0); y += 30;
+        CaptureBodyHome(allComps[bodyCombo.SelectedIndex].Comp);
+        bodyCombo.SelectedIndexChanged += delegate
+        {
+            CaptureBodyHome(allComps[bodyCombo.SelectedIndex].Comp);
+            AppendLog("Body reference set to: " + GetBestName(allComps[bodyCombo.SelectedIndex].Comp));
+        };
 
         // COVER  + step angle
         FL(form, "COVER  (will be rotated)",
@@ -424,16 +450,13 @@ public class AssemblyRotator
         FL(form, "Cover angle must be a whole multiple of the step angle (its indexed positions).",
             form.Font, Color.Gray, lx, y, 590); y += 26;
 
-        // VAC VALVE (rotates with cover)
-        FL(form, "VAC VALVE  (rotates together with COVER)",
-            new Font("Segoe UI", 9, FontStyle.Bold), Color.FromArgb(120,80,0), lx, y, 420); y += 20;
-        ComboBox vacCombo = FC(form, allComps, lx, y, cw,
-            autoVac >= 0 ? autoVac : 0); y += 26;
-        CheckBox vacChk = new CheckBox();
-        vacChk.Text = "Rotate this part together with the cover (same angle / axis / pivot)";
-        vacChk.Left = lx; vacChk.Top = y; vacChk.Width = 590;
-        vacChk.Checked = (autoVac >= 0);
-        form.Controls.Add(vacChk); y += 28;
+        // Vac valve: ALWAYS rotates with the cover (mandatory – not a user
+        // option). Auto-detected by name; shown read-only so you can see which
+        // part it resolved to, but it cannot be turned off or reassigned here.
+        Component vacComp = (autoVac >= 0) ? allComps[autoVac].Comp : null;
+        string vacName = vacComp != null ? GetBestName(vacComp) : "(none auto-detected)";
+        FL(form, "Vac valve (always rotates with cover): " + Trunc(vacName, 60),
+            form.Font, Color.FromArgb(120,80,0), lx, y, 590); y += 24;
 
         // OUTLET
         FL(form, "OUTLET  (will be rotated)",
@@ -591,14 +614,17 @@ public class AssemblyRotator
                 history.Add(op); applied.Add(op.Description);
                 AppendLog("APPLY  " + op.Description);
 
-                // Vac valve follows the cover: same angle / axis / pivot.
-                int vacIdx = vacCombo.SelectedIndex;
-                if (vacChk.Checked && vacIdx >= 0 && vacIdx != coverIdx)
+                // Vac valve ALWAYS follows the cover: same angle / axis / pivot.
+                if (vacComp != null && vacComp != allComps[coverIdx].Comp)
                 {
                     RotationOp vop = ApplyOneRotation(workPart,
-                        allComps[vacIdx].Comp, coverAngle, axis, pivot, restore);
+                        vacComp, coverAngle, axis, pivot, restore);
                     history.Add(vop); applied.Add(vop.Description + "  [with cover]");
                     AppendLog("APPLY  " + vop.Description + "  [with cover]");
+                }
+                else if (vacComp == null)
+                {
+                    AppendLog("Note: vac valve not auto-detected; rotated cover only.");
                 }
             }
 
@@ -617,6 +643,7 @@ public class AssemblyRotator
                 return;
             }
 
+            RestoreBody(workPart);  // body stays in its reference position
             redo.Clear();           // a fresh action invalidates the redo branch
             refreshButtons();
 
@@ -634,6 +661,7 @@ public class AssemblyRotator
             RotationOp op = history[history.Count - 1];
             history.RemoveAt(history.Count - 1);
             DoMove(workPart, op.Comp, -op.AngleDeg, op.Axis, op.Pivot, true);
+            RestoreBody(workPart);
             redo.Add(op);
             AppendLog("UNDO   " + op.Description);
             refreshButtons();
@@ -645,6 +673,7 @@ public class AssemblyRotator
             RotationOp op = redo[redo.Count - 1];
             redo.RemoveAt(redo.Count - 1);
             DoMove(workPart, op.Comp, op.AngleDeg, op.Axis, op.Pivot, true);
+            RestoreBody(workPart);
             history.Add(op);
             AppendLog("REDO   " + op.Description);
             refreshButtons();
@@ -656,6 +685,7 @@ public class AssemblyRotator
         form.ShowDialog();
         AppendLog("Session ended: " + history.Count + " net operation(s) applied.");
         _logBox = null;
+        _bodyComp = null; _bodyHomeSet = false;
         form.Dispose();
     }
 
@@ -667,6 +697,104 @@ public class AssemblyRotator
         _logBox.AppendText(stamp + "  " + line + Environment.NewLine);
         _logBox.SelectionStart = _logBox.TextLength;
         _logBox.ScrollToCaret();
+    }
+
+
+    // ─── Body reference lock ──────────────────────────────────────────────────
+    // The body is the fixed reference. We record its home placement once and
+    // restore it after every move so it can never be dragged out of position.
+
+    static void CaptureBodyHome(Component comp)
+    {
+        _bodyComp = comp;
+        _bodyHomeSet = false;
+        if (comp == null) return;
+        try
+        {
+            Point3d o; Matrix3x3 m;
+            comp.GetPosition(out o, out m);
+            _bodyHomeOrigin = o; _bodyHomeMatrix = m; _bodyHomeSet = true;
+        }
+        catch { }
+    }
+
+    // Force the body back to its captured reference placement. The incremental
+    // transform that maps the body's current placement (curO, curM) back to its
+    // home (homeO, homeM) is:  R = homeM * curM^T ,  t = homeO - R * curO.
+    static void RestoreBody(Part workPart)
+    {
+        if (!_bodyHomeSet || _bodyComp == null) return;
+        try
+        {
+            Point3d curO; Matrix3x3 curM;
+            _bodyComp.GetPosition(out curO, out curM);
+
+            double[,] R  = MatMul(MatOf(_bodyHomeMatrix), Transpose(MatOf(curM)));
+            double[]  rc = MatVec(R, curO.X, curO.Y, curO.Z);
+            Vector3d  t  = new Vector3d(_bodyHomeOrigin.X - rc[0],
+                                        _bodyHomeOrigin.Y - rc[1],
+                                        _bodyHomeOrigin.Z - rc[2]);
+
+            // Skip if the body is already at home (no measurable drift).
+            bool transZero = Math.Abs(t.X) < 1e-6 && Math.Abs(t.Y) < 1e-6 && Math.Abs(t.Z) < 1e-6;
+            if (IsIdentity(R) && transZero) return;
+
+            workPart.ComponentAssembly.MoveComponent(_bodyComp, t, ToNXMatrix(R));
+            AppendLog("Body held in reference position (corrected drift).");
+        }
+        catch (Exception ex)
+        {
+            AppendLog("Body lock failed: " + ex.Message);
+        }
+    }
+
+    static double[,] MatOf(Matrix3x3 m)
+    {
+        return new double[3,3] {
+            { m.Xx, m.Xy, m.Xz },
+            { m.Yx, m.Yy, m.Yz },
+            { m.Zx, m.Zy, m.Zz } };
+    }
+
+    static double[,] Transpose(double[,] a)
+    {
+        double[,] r = new double[3,3];
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++)
+                r[i,j] = a[j,i];
+        return r;
+    }
+
+    static double[,] MatMul(double[,] a, double[,] b)
+    {
+        double[,] r = new double[3,3];
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++)
+            {
+                double s = 0;
+                for (int k = 0; k < 3; k++) s += a[i,k] * b[k,j];
+                r[i,j] = s;
+            }
+        return r;
+    }
+
+    static double[] MatVec(double[,] a, double x, double y, double z)
+    {
+        return new double[] {
+            a[0,0]*x + a[0,1]*y + a[0,2]*z,
+            a[1,0]*x + a[1,1]*y + a[1,2]*z,
+            a[2,0]*x + a[2,1]*y + a[2,2]*z };
+    }
+
+    static bool IsIdentity(double[,] a)
+    {
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++)
+            {
+                double expected = (i == j) ? 1.0 : 0.0;
+                if (Math.Abs(a[i,j] - expected) > 1e-9) return false;
+            }
+        return true;
     }
 
 
