@@ -71,6 +71,18 @@
 // * The log now reports how many constraints were suppressed, so it is visible
 //   whether suppression is actually holding the body in place.
 //
+// v3.6 changes  (fix outlet "memory access violation" — nested component)
+// ───────────────────────────────────────────────────────────────────────────
+// * Root cause: ComponentAssembly.MoveComponent only works on components it
+//   owns DIRECTLY. The outlet is nested one level down (inside the body
+//   subassembly), so moving it on the top assembly crashed NX.
+// * Fix (MoveInContext): a nested component is now moved inside its own owning
+//   subassembly via Component.DirectOwner. The component reference is mapped in
+//   with ComponentAssembly.MapComponentFromParent, and the world-frame rotation
+//   is mapped into that subassembly's local frame (R_local = Mbᵀ·R·Mb, with a
+//   matching translation) so it rotates about the correct world axis/pivot.
+// * Top-level components (cover, body) are unaffected and move exactly as before.
+//
 // Usage: Open an assembly, then run via Tools -> Journal -> Play
 
 using System;
@@ -297,14 +309,16 @@ public class AssemblyRotator
     // keeps repeated MoveComponent calls from corrupting NX's internal state
     // (the "Internal error: memory access violation" crash). Returns false and
     // reports once if the move fails.
-    static bool MoveRaw(Part workPart, Component comp, Vector3d delta, double[,] R,
-        string label, bool loud)
+    // Lowest level: do the actual MoveComponent on a specific ComponentAssembly,
+    // bracketed by an undo mark + NX update so repeated moves stay stable.
+    static bool MoveRaw(ComponentAssembly asm, Component comp, Vector3d delta,
+        double[,] R, string label, bool loud)
     {
         try
         {
             NXOpen.Session.UndoMarkId mk =
                 theSession.SetUndoMark(NXOpen.Session.MarkVisibility.Invisible, label);
-            workPart.ComponentAssembly.MoveComponent(comp, delta, ToNXMatrix(R));
+            asm.MoveComponent(comp, delta, ToNXMatrix(R));
             theSession.UpdateManager.DoUpdate(mk);
             return true;
         }
@@ -316,11 +330,8 @@ public class AssemblyRotator
                 AppendLog("MoveComponent FAILED on '" + nm + "': " + ex.Message);
                 MessageBox.Show(
                     "Could not rotate:\n   " + nm + "\n\n" + ex.Message + "\n\n" +
-                    "This usually means the selected component cannot be moved at this " +
-                    "level — most often because it is nested inside a subassembly, or its " +
-                    "part is not fully loaded.\n\n" +
-                    "Fix: in the OUTLET dropdown pick a top-level component (one with no " +
-                    "indent), or fully load the assembly, then try again.",
+                    "The component's part may be read-only or not fully loaded. Fully load " +
+                    "the assembly (or open the owning subassembly) and try again.",
                     "Rotation failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
             else
@@ -331,13 +342,69 @@ public class AssemblyRotator
         }
     }
 
+    // Move a component that may be nested. ComponentAssembly.MoveComponent only
+    // works on components it owns directly, so for a nested component we move it
+    // inside its own owning subassembly (Component.DirectOwner) instead. Both the
+    // component reference (MapComponentFromParent) and the world-frame transform
+    // are mapped into that subassembly's local coordinate frame.
+    static bool MoveInContext(Part topPart, Component comp,
+        Vector3d worldDelta, double[,] Rw, string label, bool loud)
+    {
+        ComponentAssembly owner = null;
+        try { owner = comp.DirectOwner; } catch { }
+        if (owner == null) owner = topPart.ComponentAssembly;
+
+        bool topLevel = (owner.Tag == topPart.ComponentAssembly.Tag);
+        if (topLevel)
+            return MoveRaw(owner, comp, worldDelta, Rw, label, loud);
+
+        // Nested: map the transform from world into the owning subassembly frame.
+        Vector3d delta = worldDelta;
+        double[,] R = Rw;
+        Component target = comp;
+        try
+        {
+            Component parent = comp.Parent;          // owning subassembly occurrence
+            Point3d Ob; Matrix3x3 Mbn;
+            parent.GetPosition(out Ob, out Mbn);     // its placement in the displayed part
+            double[,] Mb  = MatOf(Mbn);
+            double[,] MbT = Transpose(Mb);
+
+            // R_local = Mbᵀ · Rw · Mb
+            R = MatMul(MatMul(MbT, Rw), Mb);
+
+            // delta_local = Mbᵀ · (Rw·Ob + worldDelta − Ob)
+            double[] rwOb = MatVec(Rw, Ob.X, Ob.Y, Ob.Z);
+            double[] dl = MatVec(MbT,
+                rwOb[0] + worldDelta.X - Ob.X,
+                rwOb[1] + worldDelta.Y - Ob.Y,
+                rwOb[2] + worldDelta.Z - Ob.Z);
+            delta = new Vector3d(dl[0], dl[1], dl[2]);
+        }
+        catch (Exception ex)
+        {
+            AppendLog("Context mapping failed (" + ex.Message + "); using world transform.");
+        }
+
+        // Map the component reference into the owning subassembly's context.
+        try
+        {
+            Component mapped = owner.MapComponentFromParent(comp);
+            if (mapped != null) target = mapped;
+        }
+        catch { }
+
+        AppendLog("(nested component — moving inside its subassembly)");
+        return MoveRaw(owner, target, delta, R, label, loud);
+    }
+
     // Rotate one component by angleDeg about the given axis, around the pivot.
-    static bool MoveAround(Part workPart, Component comp,
+    static bool MoveAround(Part topPart, Component comp,
         double angleDeg, string axis, Point3d pivot, string label)
     {
         double[,] dR = BuildDR(angleDeg, axis);
         Vector3d delta = ComputeDelta(dR, pivot);
-        return MoveRaw(workPart, comp, delta, dR, label, true);
+        return MoveInContext(topPart, comp, delta, dR, label, true);
     }
 
     // Validate that a rotation angle is a whole multiple of its step angle.
@@ -829,7 +896,7 @@ public class AssemblyRotator
             if (IsIdentity(R) && transZero) return;
 
             AppendLog("Body drifted from reference; correcting (suppression may not be holding it).");
-            if (MoveRaw(workPart, _bodyComp, t, R, "Body lock", false))
+            if (MoveInContext(workPart, _bodyComp, t, R, "Body lock", false))
                 AppendLog("Body held in reference position (corrected drift).");
         }
         catch (Exception ex)
