@@ -401,6 +401,43 @@ public class AssemblyRotator
         }
     }
 
+    static object InvokeNoArg(object obj, string methodName)
+    {
+        if (obj == null) return null;
+        try
+        {
+            System.Reflection.MethodInfo mi =
+                obj.GetType().GetMethod(methodName, Type.EmptyTypes);
+            if (mi == null) return null;
+            return mi.Invoke(obj, null);
+        }
+        catch { return null; }
+    }
+
+    static NXOpen.Positioning.ConstraintReference[] ConstraintRefsOf(
+        NXOpen.Positioning.Constraint c)
+    {
+        object refs = InvokeNoArg(c, "GetReferences");
+        if (refs == null) refs = InvokeNoArg(c, "GetConstraintReferences");
+
+        NXOpen.Positioning.ConstraintReference[] direct =
+            refs as NXOpen.Positioning.ConstraintReference[];
+        if (direct != null) return direct;
+
+        System.Collections.IEnumerable enumerable =
+            refs as System.Collections.IEnumerable;
+        if (enumerable == null) return new NXOpen.Positioning.ConstraintReference[0];
+
+        var list = new List<NXOpen.Positioning.ConstraintReference>();
+        foreach (object item in enumerable)
+        {
+            NXOpen.Positioning.ConstraintReference cr =
+                item as NXOpen.Positioning.ConstraintReference;
+            if (cr != null) list.Add(cr);
+        }
+        return list.ToArray();
+    }
+
 
     // ─── Outlet connectivity (rotate everything attached to the outlet) ─────────
     // Mirrors the cover behaviour (cover + vac valve), but generalised: starting
@@ -433,9 +470,7 @@ public class AssemblyRotator
     static Component CompOfRef(NXOpen.Positioning.ConstraintReference cr)
     {
         if (cr == null) return null;
-        NXObject mov = null;
-        try { mov = cr.GetMovableObject(); }
-        catch { return null; }
+        object mov = InvokeNoArg(cr, "GetMovableObject");
         return mov as Component;   // managed cast only — no native geometry deref
     }
 
@@ -476,7 +511,7 @@ public class AssemblyRotator
                     var comps = new List<Component>();
                     try
                     {
-                        foreach (NXOpen.Positioning.ConstraintReference cr in c.GetReferences())
+                        foreach (NXOpen.Positioning.ConstraintReference cr in ConstraintRefsOf(c))
                         {
                             Component oc = CompOfRef(cr);
                             if (oc != null) { comps.Add(oc); compByTag[oc.Tag] = oc; }
