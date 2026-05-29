@@ -52,6 +52,15 @@
 // * Vac valve is mandatory and no longer a configurable option: it is auto
 //   detected and always rotates with the cover (shown read-only for reference).
 //
+// v3.4 changes  (fix "MoveComponent: Internal error: memory access violation")
+// ───────────────────────────────────────────────────────────────────────────
+// * Every MoveComponent is now bracketed by an undo mark and followed by an NX
+//   update (MoveRaw). Updating after each move stops the internal-state
+//   corruption that crashed NX when several moves ran back-to-back.
+// * Constraints are suppressed ONCE per action instead of before every single
+//   move, so we no longer re-cycle the whole part repeatedly.
+// * A failed move now stops cleanly and is reported, instead of continuing.
+//
 // Usage: Open an assembly, then run via Tools -> Journal -> Play
 
 using System;
@@ -272,21 +281,43 @@ public class AssemblyRotator
 
     // ─── Core rotation ────────────────────────────────────────────────────────
 
-    // Apply one rotation, build the RotationOp record and return it. Constraints
-    // are suppressed first so the solver cannot revert the move, and are only
-    // restored if the caller asked for it (which may let the position revert).
-    static RotationOp ApplyOneRotation(Part workPart, Component comp,
-        double angleDeg, string axis, Point3d pivot, bool restoreAfter)
+    // Low-level move: rotate/translate one component, then immediately run an
+    // NX update bracketed by an undo mark. Updating after EVERY move is what
+    // keeps repeated MoveComponent calls from corrupting NX's internal state
+    // (the "Internal error: memory access violation" crash). Returns false and
+    // reports once if the move fails.
+    static bool MoveRaw(Part workPart, Component comp, Vector3d delta, double[,] R, string label)
     {
-        var suppressed = SuppressAllConstraints(workPart);
-        DoMove(workPart, comp, angleDeg, axis, pivot, false);
-
-        if (restoreAfter && suppressed.Count > 0)
+        try
         {
-            RestoreConstraints(suppressed);
-            AppendLog("Constraints RESTORED (position may revert on next update).");
+            NXOpen.Session.UndoMarkId mk =
+                theSession.SetUndoMark(NXOpen.Session.MarkVisibility.Invisible, label);
+            workPart.ComponentAssembly.MoveComponent(comp, delta, ToNXMatrix(R));
+            theSession.UpdateManager.DoUpdate(mk);
+            return true;
         }
+        catch (Exception ex)
+        {
+            AppendLog("MoveComponent failed: " + ex.Message);
+            MessageBox.Show("MoveComponent failed: " + ex.Message +
+                "\n\nThe operation was stopped at this step.",
+                "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return false;
+        }
+    }
 
+    // Rotate one component by angleDeg about the given axis, around the pivot.
+    static bool MoveAround(Part workPart, Component comp,
+        double angleDeg, string axis, Point3d pivot, string label)
+    {
+        double[,] dR = BuildDR(angleDeg, axis);
+        Vector3d delta = ComputeDelta(dR, pivot);
+        return MoveRaw(workPart, comp, delta, dR, label);
+    }
+
+    // Build the undo/redo record for a rotation that was applied.
+    static RotationOp MakeOp(Component comp, double angleDeg, string axis, Point3d pivot)
+    {
         RotationOp op = new RotationOp();
         op.Comp = comp;
         op.CompName = GetBestName(comp);
@@ -297,26 +328,6 @@ public class AssemblyRotator
             "   pivot(" + pivot.X.ToString("F1") + ", " +
             pivot.Y.ToString("F1") + ", " + pivot.Z.ToString("F1") + ")";
         return op;
-    }
-
-    // Pure incremental move around the pivot. suppressFirst lets undo/redo make
-    // sure constraints are out of the way before stepping the position.
-    static void DoMove(Part workPart, Component comp,
-        double angleDeg, string axis, Point3d pivot, bool suppressFirst)
-    {
-        if (suppressFirst) SuppressAllConstraints(workPart);
-        double[,] dR = BuildDR(angleDeg, axis);
-        Vector3d delta = ComputeDelta(dR, pivot);
-        try
-        {
-            workPart.ComponentAssembly.MoveComponent(comp, delta, ToNXMatrix(dR));
-        }
-        catch (Exception ex)
-        {
-            AppendLog("MoveComponent failed: " + ex.Message);
-            MessageBox.Show("MoveComponent failed: " + ex.Message,
-                "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-        }
     }
 
 
@@ -604,46 +615,73 @@ public class AssemblyRotator
                 }
             }
 
-            var applied = new List<string>();
-
-            if (coverAngle != 0)
-            {
-                int coverIdx = coverCombo.SelectedIndex;
-                RotationOp op = ApplyOneRotation(workPart,
-                    allComps[coverIdx].Comp, coverAngle, axis, pivot, restore);
-                history.Add(op); applied.Add(op.Description);
-                AppendLog("APPLY  " + op.Description);
-
-                // Vac valve ALWAYS follows the cover: same angle / axis / pivot.
-                if (vacComp != null && vacComp != allComps[coverIdx].Comp)
-                {
-                    RotationOp vop = ApplyOneRotation(workPart,
-                        vacComp, coverAngle, axis, pivot, restore);
-                    history.Add(vop); applied.Add(vop.Description + "  [with cover]");
-                    AppendLog("APPLY  " + vop.Description + "  [with cover]");
-                }
-                else if (vacComp == null)
-                {
-                    AppendLog("Note: vac valve not auto-detected; rotated cover only.");
-                }
-            }
-
-            if (outletAngle != 0)
-            {
-                RotationOp op = ApplyOneRotation(workPart,
-                    allComps[outletCombo.SelectedIndex].Comp, outletAngle, axis, pivot, restore);
-                history.Add(op); applied.Add(op.Description);
-                AppendLog("APPLY  " + op.Description);
-            }
-
-            if (applied.Count == 0)
+            if (coverAngle == 0 && outletAngle == 0)
             {
                 MessageBox.Show("Both angles are 0 — nothing to rotate.",
                     "Nothing applied", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
 
+            // Suppress constraints ONCE for the whole action (not per move) so
+            // the solver cannot revert anything and we avoid hammering the model.
+            var suppressed = SuppressAllConstraints(workPart);
+
+            var newOps  = new List<RotationOp>();
+            var applied = new List<string>();
+
+            if (coverAngle != 0)
+            {
+                Component coverComp = allComps[coverCombo.SelectedIndex].Comp;
+                if (MoveAround(workPart, coverComp, coverAngle, axis, pivot, "Rotate cover"))
+                {
+                    RotationOp op = MakeOp(coverComp, coverAngle, axis, pivot);
+                    newOps.Add(op); applied.Add(op.Description);
+                    AppendLog("APPLY  " + op.Description);
+
+                    // Vac valve ALWAYS follows the cover: same angle/axis/pivot.
+                    if (vacComp != null && vacComp != coverComp)
+                    {
+                        if (MoveAround(workPart, vacComp, coverAngle, axis, pivot, "Rotate vac valve"))
+                        {
+                            RotationOp vop = MakeOp(vacComp, coverAngle, axis, pivot);
+                            newOps.Add(vop); applied.Add(vop.Description + "  [with cover]");
+                            AppendLog("APPLY  " + vop.Description + "  [with cover]");
+                        }
+                    }
+                    else if (vacComp == null)
+                    {
+                        AppendLog("Note: vac valve not auto-detected; rotated cover only.");
+                    }
+                }
+            }
+
+            if (outletAngle != 0)
+            {
+                Component outletComp = allComps[outletCombo.SelectedIndex].Comp;
+                if (MoveAround(workPart, outletComp, outletAngle, axis, pivot, "Rotate outlet"))
+                {
+                    RotationOp op = MakeOp(outletComp, outletAngle, axis, pivot);
+                    newOps.Add(op); applied.Add(op.Description);
+                    AppendLog("APPLY  " + op.Description);
+                }
+            }
+
             RestoreBody(workPart);  // body stays in its reference position
+
+            if (restore && suppressed.Count > 0)
+            {
+                RestoreConstraints(suppressed);
+                AppendLog("Constraints RESTORED (position may revert on next update).");
+            }
+
+            if (newOps.Count == 0)
+            {
+                MessageBox.Show("Nothing was rotated (the move was rejected).",
+                    "Nothing applied", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            history.AddRange(newOps);
             redo.Clear();           // a fresh action invalidates the redo branch
             refreshButtons();
 
@@ -659,9 +697,10 @@ public class AssemblyRotator
         {
             if (history.Count == 0) return;
             RotationOp op = history[history.Count - 1];
-            history.RemoveAt(history.Count - 1);
-            DoMove(workPart, op.Comp, -op.AngleDeg, op.Axis, op.Pivot, true);
+            SuppressAllConstraints(workPart);
+            if (!MoveAround(workPart, op.Comp, -op.AngleDeg, op.Axis, op.Pivot, "Undo rotate")) return;
             RestoreBody(workPart);
+            history.RemoveAt(history.Count - 1);
             redo.Add(op);
             AppendLog("UNDO   " + op.Description);
             refreshButtons();
@@ -671,9 +710,10 @@ public class AssemblyRotator
         {
             if (redo.Count == 0) return;
             RotationOp op = redo[redo.Count - 1];
-            redo.RemoveAt(redo.Count - 1);
-            DoMove(workPart, op.Comp, op.AngleDeg, op.Axis, op.Pivot, true);
+            SuppressAllConstraints(workPart);
+            if (!MoveAround(workPart, op.Comp, op.AngleDeg, op.Axis, op.Pivot, "Redo rotate")) return;
             RestoreBody(workPart);
+            redo.RemoveAt(redo.Count - 1);
             history.Add(op);
             AppendLog("REDO   " + op.Description);
             refreshButtons();
@@ -735,12 +775,14 @@ public class AssemblyRotator
                                         _bodyHomeOrigin.Y - rc[1],
                                         _bodyHomeOrigin.Z - rc[2]);
 
-            // Skip if the body is already at home (no measurable drift).
+            // Skip if the body is already at home (no measurable drift). This is
+            // the normal case, so the body lock costs nothing when constraints
+            // are properly suppressed.
             bool transZero = Math.Abs(t.X) < 1e-6 && Math.Abs(t.Y) < 1e-6 && Math.Abs(t.Z) < 1e-6;
             if (IsIdentity(R) && transZero) return;
 
-            workPart.ComponentAssembly.MoveComponent(_bodyComp, t, ToNXMatrix(R));
-            AppendLog("Body held in reference position (corrected drift).");
+            if (MoveRaw(workPart, _bodyComp, t, R, "Body lock"))
+                AppendLog("Body held in reference position (corrected drift).");
         }
         catch (Exception ex)
         {
