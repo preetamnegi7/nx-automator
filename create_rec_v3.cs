@@ -312,10 +312,16 @@ public class AssemblyRotator
         {
             if (loud)
             {
-                AppendLog("MoveComponent failed: " + ex.Message);
-                MessageBox.Show("MoveComponent failed: " + ex.Message +
-                    "\n\nThe operation was stopped at this step.",
-                    "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                string nm = GetBestName(comp);
+                AppendLog("MoveComponent FAILED on '" + nm + "': " + ex.Message);
+                MessageBox.Show(
+                    "Could not rotate:\n   " + nm + "\n\n" + ex.Message + "\n\n" +
+                    "This usually means the selected component cannot be moved at this " +
+                    "level — most often because it is nested inside a subassembly, or its " +
+                    "part is not fully loaded.\n\n" +
+                    "Fix: in the OUTLET dropdown pick a top-level component (one with no " +
+                    "indent), or fully load the assembly, then try again.",
+                    "Rotation failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
             else
             {
@@ -663,7 +669,9 @@ public class AssemblyRotator
 
             if (coverAngle != 0)
             {
-                Component coverComp = allComps[coverCombo.SelectedIndex].Comp;
+                CompInfo ci = allComps[coverCombo.SelectedIndex];
+                AppendLog("Cover target: " + ci.FullName + "  (tree level " + ci.Level + ")");
+                Component coverComp = ci.Comp;
                 if (MoveAround(workPart, coverComp, coverAngle, axis, pivot, "Rotate cover"))
                 {
                     RotationOp op = MakeOp(coverComp, coverAngle, axis, pivot);
@@ -689,7 +697,9 @@ public class AssemblyRotator
 
             if (outletAngle != 0)
             {
-                Component outletComp = allComps[outletCombo.SelectedIndex].Comp;
+                CompInfo oi = allComps[outletCombo.SelectedIndex];
+                AppendLog("Outlet target: " + oi.FullName + "  (tree level " + oi.Level + ")");
+                Component outletComp = oi.Comp;
                 if (MoveAround(workPart, outletComp, outletAngle, axis, pivot, "Rotate outlet"))
                 {
                     RotationOp op = MakeOp(outletComp, outletAngle, axis, pivot);
