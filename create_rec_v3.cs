@@ -116,6 +116,21 @@
 //   Every part found (and every stop) is written to the Change Log, so a single
 //   run shows exactly what was detected.
 //
+// v3.9 changes  (compile fixes — wrong API names + missing assembly reference)
+// ───────────────────────────────────────────────────────────────────────────
+// * HashSet<T> lives in System.Core.dll, which NX's journal Play compiler does
+//   not reference (only mscorlib). Replaced it with a small Dictionary-backed
+//   TagSet so the connectivity sets compile. (Func/Action compiled because they
+//   are in mscorlib in .NET 4.0; HashSet stayed in System.Core.dll.)
+// * Corrected the constraint API to the real NXOpen.Positioning members
+//   (the names used before did not exist in NX):
+//       Constraint.GetReferences()             not GetConstraintReferences()
+//       ConstraintReference.GetGeometry()       not the .Geometry property
+//       ConstraintReference.GetMovableObject()  (new — the component being
+//                                                positioned, tried first)
+//   The component for each reference is the movable object when it is a
+//   Component, else the geometry's NXObject.OwningComponent.
+//
 // Usage: Open an assembly, then run via Tools -> Journal -> Play
 
 using System;
@@ -370,20 +385,47 @@ public class AssemblyRotator
     // IMPORTANT: build this graph BEFORE the constraints are suppressed — a
     // suppressed constraint no longer describes the connection we must follow.
 
-    // Resolve the component that owns a constraint reference's geometry. The
-    // geometry is usually a face/edge inside a component occurrence; for a
-    // component-level reference it is the component itself.
+    // Resolve the assembly component a constraint reference belongs to.
+    //
+    // NX Open API (verified against the NXOpen.Positioning reference):
+    //   * Constraint.GetReferences()            -> ConstraintReference[]
+    //   * ConstraintReference.GetMovableObject() -> NXObject  (the object being
+    //         positioned; for a component constraint this IS the component)
+    //   * ConstraintReference.GetGeometry()      -> NXObject  (the face/edge used
+    //         to define the constraint; its OwningComponent is the component)
+    //
+    // We try the movable object first (most direct), then fall back to the
+    // geometry's owning component. Every call is guarded so a reference type we
+    // don't expect simply yields null instead of throwing.
     static Component CompOfRef(NXOpen.Positioning.ConstraintReference cr)
     {
-        try
-        {
-            NXObject g = cr.Geometry;
-            if (g == null) return null;
-            Component asComp = g as Component;
-            if (asComp != null) return asComp;
-            return g.OwningComponent;
-        }
-        catch { return null; }
+        if (cr == null) return null;
+        Component c = ComponentOf(SafeMovable(cr));
+        if (c != null) return c;
+        return ComponentOf(SafeGeometry(cr));
+    }
+
+    static NXObject SafeMovable(NXOpen.Positioning.ConstraintReference cr)
+    {
+        try { return cr.GetMovableObject(); } catch { return null; }
+    }
+
+    static NXObject SafeGeometry(NXOpen.Positioning.ConstraintReference cr)
+    {
+        try { return cr.GetGeometry(); } catch { return null; }
+    }
+
+    // The component an object belongs to: the object itself if it is a component,
+    // otherwise its owning component when it is occurrence geometry (a face/edge
+    // inside a component). OwningComponent is null for non-occurrence objects.
+    static Component ComponentOf(NXObject obj)
+    {
+        if (obj == null) return null;
+        Component asComp = obj as Component;
+        if (asComp != null) return asComp;
+        try { if (obj.IsOccurrence) return obj.OwningComponent; } catch { }
+        try { return obj.OwningComponent; } catch { }
+        return null;
     }
 
     static void AddEdge(Dictionary<Tag, List<Tag>> graph, Tag a, Tag b)
@@ -419,7 +461,7 @@ public class AssemblyRotator
                     var comps = new List<Component>();
                     try
                     {
-                        foreach (NXOpen.Positioning.ConstraintReference cr in c.GetConstraintReferences())
+                        foreach (NXOpen.Positioning.ConstraintReference cr in c.GetReferences())
                         {
                             Component oc = CompOfRef(cr);
                             if (oc != null) { comps.Add(oc); compByTag[oc.Tag] = oc; }
