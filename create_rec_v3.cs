@@ -61,6 +61,16 @@
 //   move, so we no longer re-cycle the whole part repeatedly.
 // * A failed move now stops cleanly and is reported, instead of continuing.
 //
+// v3.5 changes
+// ────────────
+// * Outlet now has its own step angle, enforced exactly like the cover.
+// * After a successful Apply, the cover and outlet angle fields reset to 0 so
+//   the same rotation cannot be applied twice by accident (0 = already done).
+// * The body lock can no longer crash the run: if it fails it is reported
+//   quietly in the log and the rotation still stands (no error dialog).
+// * The log now reports how many constraints were suppressed, so it is visible
+//   whether suppression is actually holding the body in place.
+//
 // Usage: Open an assembly, then run via Tools -> Journal -> Play
 
 using System;
@@ -267,6 +277,7 @@ public class AssemblyRotator
         {
             AppendLog("Warning: constraint scan failed: " + ex.Message);
         }
+        AppendLog("Suppressed " + suppressed.Count + " constraint(s).");
         return suppressed;
     }
 
@@ -286,7 +297,8 @@ public class AssemblyRotator
     // keeps repeated MoveComponent calls from corrupting NX's internal state
     // (the "Internal error: memory access violation" crash). Returns false and
     // reports once if the move fails.
-    static bool MoveRaw(Part workPart, Component comp, Vector3d delta, double[,] R, string label)
+    static bool MoveRaw(Part workPart, Component comp, Vector3d delta, double[,] R,
+        string label, bool loud)
     {
         try
         {
@@ -298,10 +310,17 @@ public class AssemblyRotator
         }
         catch (Exception ex)
         {
-            AppendLog("MoveComponent failed: " + ex.Message);
-            MessageBox.Show("MoveComponent failed: " + ex.Message +
-                "\n\nThe operation was stopped at this step.",
-                "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            if (loud)
+            {
+                AppendLog("MoveComponent failed: " + ex.Message);
+                MessageBox.Show("MoveComponent failed: " + ex.Message +
+                    "\n\nThe operation was stopped at this step.",
+                    "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            else
+            {
+                AppendLog("Body lock could not correct drift (" + ex.Message + ").");
+            }
             return false;
         }
     }
@@ -312,7 +331,37 @@ public class AssemblyRotator
     {
         double[,] dR = BuildDR(angleDeg, axis);
         Vector3d delta = ComputeDelta(dR, pivot);
-        return MoveRaw(workPart, comp, delta, dR, label);
+        return MoveRaw(workPart, comp, delta, dR, label, true);
+    }
+
+    // Validate that a rotation angle is a whole multiple of its step angle.
+    // Returns false (and shows why) if the angle is not feasible.
+    static bool StepOk(double angle, double step, string name)
+    {
+        if (angle == 0) return true;
+        if (step <= 0)
+        {
+            MessageBox.Show(
+                "Enter the " + name + " step angle first.\n\n" +
+                "The " + name.ToLower() + " has indexed / stepped positions, so its rotation " +
+                "must be a whole multiple of the step angle. This prevents moving it to a " +
+                "position that is not physically feasible.",
+                "Step angle required", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return false;
+        }
+        double ratio = angle / step;
+        double nearest = Math.Round(ratio);
+        if (Math.Abs(angle - nearest * step) > 0.001)
+        {
+            double low  = Math.Floor(ratio)  * step;
+            double high = Math.Ceiling(ratio) * step;
+            MessageBox.Show(
+                name + " angle " + angle + "° is not a multiple of the step angle " +
+                step + "°.\n\nNearest feasible values: " + low + "° or " + high + "°.",
+                "Invalid " + name + " angle", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return false;
+        }
+        return true;
     }
 
     // Build the undo/redo record for a rotation that was applied.
@@ -457,7 +506,7 @@ public class AssemblyRotator
         FL(form, "Rotation angle:", form.Font, Color.Black, lx, y+3, 100);
         TextBox coverAngleBox = FT(form, "0", lx+105, y, 70);
         FL(form, "Step angle (deg):", form.Font, Color.Black, lx+200, y+3, 110);
-        TextBox stepBox = FT(form, "", lx+315, y, 70); y += 24;
+        TextBox coverStepBox = FT(form, "", lx+315, y, 70); y += 24;
         FL(form, "Cover angle must be a whole multiple of the step angle (its indexed positions).",
             form.Font, Color.Gray, lx, y, 590); y += 26;
 
@@ -469,13 +518,17 @@ public class AssemblyRotator
         FL(form, "Vac valve (always rotates with cover): " + Trunc(vacName, 60),
             form.Font, Color.FromArgb(120,80,0), lx, y, 590); y += 24;
 
-        // OUTLET
+        // OUTLET  + step angle
         FL(form, "OUTLET  (will be rotated)",
             new Font("Segoe UI", 9, FontStyle.Bold), Color.FromArgb(0,130,0), lx, y, 300); y += 20;
         ComboBox outletCombo = FC(form, allComps, lx, y, cw,
             autoOutlet >= 0 ? autoOutlet : Math.Min(2, allComps.Count-1)); y += 26;
         FL(form, "Rotation angle:", form.Font, Color.Black, lx, y+3, 100);
-        TextBox outletAngleBox = FT(form, "0", lx+105, y, 70); y += 32;
+        TextBox outletAngleBox = FT(form, "0", lx+105, y, 70);
+        FL(form, "Step angle (deg):", form.Font, Color.Black, lx+200, y+3, 110);
+        TextBox outletStepBox = FT(form, "", lx+315, y, 70); y += 24;
+        FL(form, "Outlet angle must be a whole multiple of its step angle (its indexed positions).",
+            form.Font, Color.Gray, lx, y, 590); y += 26;
 
         HS(form, lx, y, cw); y += 10;
 
@@ -580,40 +633,19 @@ public class AssemblyRotator
             double.TryParse(pivZ.Text, out pz2);
             Point3d pivot = new Point3d(px2, py2, pz2);
 
-            double coverAngle, outletAngle, step;
-            if (!double.TryParse(coverAngleBox.Text,  out coverAngle))  coverAngle  = 0;
-            if (!double.TryParse(outletAngleBox.Text, out outletAngle)) outletAngle = 0;
-            if (!double.TryParse(stepBox.Text,        out step))        step        = 0;
+            double coverAngle, outletAngle, coverStep, outletStep;
+            if (!double.TryParse(coverAngleBox.Text,   out coverAngle))  coverAngle  = 0;
+            if (!double.TryParse(outletAngleBox.Text,  out outletAngle)) outletAngle = 0;
+            if (!double.TryParse(coverStepBox.Text,    out coverStep))   coverStep   = 0;
+            if (!double.TryParse(outletStepBox.Text,   out outletStep))  outletStep  = 0;
 
             bool restore = restoreChk.Checked;
 
-            // Cover step-angle enforcement: the cover only has discrete indexed
-            // positions, so its rotation must be a whole multiple of the step.
-            if (coverAngle != 0)
-            {
-                if (step <= 0)
-                {
-                    MessageBox.Show(
-                        "Enter the COVER step angle first.\n\n" +
-                        "The cover has indexed / stepped positions, so its rotation must be a " +
-                        "whole multiple of the step angle. This prevents moving it to a position " +
-                        "that is not physically feasible.",
-                        "Step angle required", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                    return;
-                }
-                double ratio = coverAngle / step;
-                double nearest = Math.Round(ratio);
-                if (Math.Abs(coverAngle - nearest * step) > 0.001)
-                {
-                    double low  = Math.Floor(ratio)   * step;
-                    double high = Math.Ceiling(ratio)  * step;
-                    MessageBox.Show(
-                        "Cover angle " + coverAngle + "° is not a multiple of the step angle " +
-                        step + "°.\n\nNearest feasible values: " + low + "° or " + high + "°.",
-                        "Invalid cover angle", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                    return;
-                }
-            }
+            // Step-angle enforcement: cover and outlet each only have discrete
+            // indexed positions, so each rotation must be a whole multiple of its
+            // own step angle.
+            if (!StepOk(coverAngle, coverStep, "Cover")) return;
+            if (!StepOk(outletAngle, outletStep, "Outlet")) return;
 
             if (coverAngle == 0 && outletAngle == 0)
             {
@@ -684,6 +716,11 @@ public class AssemblyRotator
             history.AddRange(newOps);
             redo.Clear();           // a fresh action invalidates the redo branch
             refreshButtons();
+
+            // Reset the angle fields to 0 so the same rotation is not applied
+            // twice by mistake; a 0 here means "the change has been made".
+            coverAngleBox.Text = "0";
+            outletAngleBox.Text = "0";
 
             // Pop-up message block summarising what just changed.
             string msg = "Applied " + applied.Count + " rotation(s):\n\n  " +
@@ -781,7 +818,8 @@ public class AssemblyRotator
             bool transZero = Math.Abs(t.X) < 1e-6 && Math.Abs(t.Y) < 1e-6 && Math.Abs(t.Z) < 1e-6;
             if (IsIdentity(R) && transZero) return;
 
-            if (MoveRaw(workPart, _bodyComp, t, R, "Body lock"))
+            AppendLog("Body drifted from reference; correcting (suppression may not be holding it).");
+            if (MoveRaw(workPart, _bodyComp, t, R, "Body lock", false))
                 AppendLog("Body held in reference position (corrected drift).");
         }
         catch (Exception ex)
