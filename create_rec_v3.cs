@@ -21,6 +21,18 @@
 //   so the component rotates around the specified pivot point.
 // * Auto-pivot is read from the body's origin via Component.GetPosition (managed API).
 //
+// Interactive session (v3.1)
+// ──────────────────────────
+// * "Apply Rotation" no longer closes the macro. The dialog stays open so you
+//   can apply many rotations in one session.
+// * Every rotation is recorded as an operation in a Change Log:
+//     - a live log panel inside the dialog updates after each action, and
+//     - a message block pops up after each Apply summarising what changed.
+// * Undo / Redo buttons walk an operation stack and re-apply the inverse /
+//   original rotation (delta + matrix) so positions can be stepped back and
+//   forward without re-running the macro.
+// * The only thing that ends the session is the Close button.
+//
 // Usage: Open an assembly, then run via Tools -> Journal -> Play
 
 using System;
@@ -53,6 +65,18 @@ public class AssemblyRotator
         public int Quantity;
         public int MinLevel = int.MaxValue;
         public List<Component> Instances = new List<Component>();
+    }
+
+    // One applied rotation, kept on the undo / redo stacks so it can be
+    // replayed forwards (redo) or inverted (undo).
+    class RotationOp
+    {
+        public Component Comp;
+        public string CompName;
+        public double AngleDeg;
+        public string Axis;
+        public Point3d Pivot;
+        public string Description;
     }
 
     public static void Main(string[] args)
@@ -98,45 +122,15 @@ public class AssemblyRotator
         if (autoBody >= 0)
             defaultPivot = TryGetComponentOrigin(allComps[autoBody].Comp);
 
-        int bodyIdx, coverIdx, outletIdx;
-        double coverAngle, outletAngle;
-        string rotAxis;
-        Point3d pivot;
-        bool restoreConstraints;
+        lw.Open();
+        lw.WriteLine("=== Assembly Component Rotator v3 (interactive) ===");
 
-        bool ok = ShowSelectionDialog(allComps, autoBody, autoCover, autoOutlet,
-            defaultPivot,
-            out bodyIdx, out coverIdx, out outletIdx,
-            out coverAngle, out outletAngle, out rotAxis, out pivot,
-            out restoreConstraints);
+        // Single interactive dialog drives the whole session: apply, undo,
+        // redo and the change log all live inside it. It only returns when
+        // the user clicks Close.
+        RunRotatorDialog(workPart, allComps, autoBody, autoCover, autoOutlet, defaultPivot);
 
-        if (!ok) { lw.WriteLine("Cancelled by user."); return; }
-
-        lw.WriteLine("Selection:");
-        lw.WriteLine("  Body   (FIXED): " + allComps[bodyIdx].FullName);
-        lw.WriteLine("  Cover:          " + allComps[coverIdx].FullName  + "  ->  " + coverAngle  + " deg");
-        lw.WriteLine("  Outlet:         " + allComps[outletIdx].FullName + "  ->  " + outletAngle + " deg");
-        lw.WriteLine("  Axis:           " + rotAxis);
-        lw.WriteLine("  Pivot:          (" + pivot.X + ", " + pivot.Y + ", " + pivot.Z + ")");
-        lw.WriteLine("  Restore constraints after: " + restoreConstraints);
-        lw.WriteLine("");
-
-        if (coverAngle  != 0)
-            RotateComponent(workPart, allComps[coverIdx].Comp,  coverAngle,  rotAxis, pivot, restoreConstraints);
-        else
-            lw.WriteLine("  Cover:  skipped (0 deg)");
-
-        if (outletAngle != 0)
-            RotateComponent(workPart, allComps[outletIdx].Comp, outletAngle, rotAxis, pivot, restoreConstraints);
-        else
-            lw.WriteLine("  Outlet: skipped (0 deg)");
-
-        lw.WriteLine("");
-        lw.WriteLine("=== Done! ===");
-        if (!restoreConstraints)
-            lw.WriteLine("NOTE: Constraints were suppressed and left suppressed to hold");
-        lw.WriteLine("      the new position. To re-constrain, use Assembly Navigator");
-        lw.WriteLine("      -> right-click constraint -> Unsuppress.");
+        lw.WriteLine("=== Session ended ===");
     }
 
 
@@ -193,6 +187,17 @@ public class AssemblyRotator
         return m;
     }
 
+    // delta = pivot - R*pivot  →  MoveComponent rotates the component around the
+    // given pivot point rather than around the world origin.
+    static Vector3d ComputeDelta(double[,] dR, Point3d pivot)
+    {
+        double px = pivot.X, py = pivot.Y, pz = pivot.Z;
+        return new Vector3d(
+            px - (dR[0,0]*px + dR[0,1]*py + dR[0,2]*pz),
+            py - (dR[1,0]*px + dR[1,1]*py + dR[1,2]*pz),
+            pz - (dR[2,0]*px + dR[2,1]*py + dR[2,2]*pz));
+    }
+
 
     // ─── Constraint suppression ───────────────────────────────────────────────
     // UFObj.AskSuppression / SetSuppression are not available in all NX C# builds.
@@ -244,52 +249,52 @@ public class AssemblyRotator
 
     // ─── Core rotation ────────────────────────────────────────────────────────
 
-    static void RotateComponent(Part workPart, Component comp,
+    // Apply one rotation, build the RotationOp record and return it. Constraints
+    // are suppressed first so the solver cannot revert the move, and are only
+    // restored if the caller asked for it (which may let the position revert).
+    static RotationOp ApplyOneRotation(Part workPart, Component comp,
         double angleDeg, string axis, Point3d pivot, bool restoreAfter)
     {
-        string name = GetBestName(comp);
-        lw.WriteLine("─── " + name + " ───");
-        lw.WriteLine("  Angle: " + angleDeg + " deg   Axis: " + axis);
-        lw.WriteLine("  Pivot: (" + pivot.X.ToString("F3") + ", " +
-                      pivot.Y.ToString("F3") + ", " + pivot.Z.ToString("F3") + ")");
-
-        double[,] dR = BuildDR(angleDeg, axis);
-
-        // delta = pivot - R*pivot  →  MoveComponent rotates the component
-        // around the given pivot point rather than around the world origin.
-        double px = pivot.X, py = pivot.Y, pz = pivot.Z;
-        Vector3d delta = new Vector3d(
-            px - (dR[0,0]*px + dR[0,1]*py + dR[0,2]*pz),
-            py - (dR[1,0]*px + dR[1,1]*py + dR[1,2]*pz),
-            pz - (dR[2,0]*px + dR[2,1]*py + dR[2,2]*pz));
-
-        // Step 1: suppress constraints so the solver cannot revert the move.
-        // Constraints are left suppressed by default (controlled by dialog checkbox).
         var suppressed = SuppressAllConstraints(workPart);
+        DoMove(workPart, comp, angleDeg, axis, pivot, false);
 
-        // Step 2: apply the incremental rotation around the pivot.
-        try
-        {
-            workPart.ComponentAssembly.MoveComponent(comp, delta, ToNXMatrix(dR));
-            lw.WriteLine("  MoveComponent: OK");
-        }
-        catch (Exception ex)
-        {
-            lw.WriteLine("  MoveComponent failed: " + ex.Message);
-        }
-
-        // Step 3: optionally restore constraints.
         if (restoreAfter && suppressed.Count > 0)
         {
             RestoreConstraints(suppressed);
             lw.WriteLine("  Constraints RESTORED (new position may revert on next update).");
         }
-        else if (suppressed.Count > 0)
-        {
-            lw.WriteLine("  Constraints left SUPPRESSED to hold the new position.");
-        }
 
-        lw.WriteLine("");
+        RotationOp op = new RotationOp();
+        op.Comp = comp;
+        op.CompName = GetBestName(comp);
+        op.AngleDeg = angleDeg;
+        op.Axis = axis;
+        op.Pivot = pivot;
+        op.Description = op.CompName + "   " + angleDeg + " deg about " + axis +
+            "   pivot(" + pivot.X.ToString("F1") + ", " +
+            pivot.Y.ToString("F1") + ", " + pivot.Z.ToString("F1") + ")";
+        return op;
+    }
+
+    // Pure incremental move around the pivot. suppressFirst lets undo/redo make
+    // sure constraints are out of the way before stepping the position.
+    static void DoMove(Part workPart, Component comp,
+        double angleDeg, string axis, Point3d pivot, bool suppressFirst)
+    {
+        if (suppressFirst) SuppressAllConstraints(workPart);
+        double[,] dR = BuildDR(angleDeg, axis);
+        Vector3d delta = ComputeDelta(dR, pivot);
+        try
+        {
+            workPart.ComponentAssembly.MoveComponent(comp, delta, ToNXMatrix(dR));
+            lw.WriteLine("  MoveComponent: OK  (" + angleDeg + " deg about " + axis + ")");
+        }
+        catch (Exception ex)
+        {
+            lw.WriteLine("  MoveComponent failed: " + ex.Message);
+            MessageBox.Show("MoveComponent failed: " + ex.Message,
+                "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
     }
 
 
@@ -356,23 +361,19 @@ public class AssemblyRotator
     }
 
 
-    // ─── Selection dialog ─────────────────────────────────────────────────────
+    // ─── Interactive rotator dialog ───────────────────────────────────────────
+    // Stays open for the whole session. Apply rotates in place and logs; Undo /
+    // Redo step the operation stack; Close ends the session.
 
-    static bool ShowSelectionDialog(List<CompInfo> allComps,
-        int autoBody, int autoCover, int autoOutlet,
-        Point3d defaultPivot,
-        out int bodyIdx, out int coverIdx, out int outletIdx,
-        out double coverAngle, out double outletAngle,
-        out string rotAxis, out Point3d pivot,
-        out bool restoreConstraints)
+    static void RunRotatorDialog(Part workPart, List<CompInfo> allComps,
+        int autoBody, int autoCover, int autoOutlet, Point3d defaultPivot)
     {
-        bodyIdx = 0; coverIdx = 0; outletIdx = 0;
-        coverAngle = 0; outletAngle = 0; rotAxis = "Z";
-        pivot = defaultPivot; restoreConstraints = false;
+        var history = new List<RotationOp>();   // applied ops (undo stack)
+        var redo    = new List<RotationOp>();   // undone ops (redo stack)
 
         Form form = new Form();
         form.Text = "Assembly Component Rotator v3";
-        form.Width = 630; form.Height = 730;
+        form.Width = 650; form.Height = 760;
         form.StartPosition = FormStartPosition.CenterScreen;
         form.TopMost = true;
         form.FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -381,7 +382,7 @@ public class AssemblyRotator
         form.Font = new Font("Segoe UI", 9);
 
         int y = 12;
-        const int lx = 15, cw = 578;
+        const int lx = 15, cw = 598;
 
         // Header
         FL(form, "ASSEMBLY COMPONENT ROTATOR  v3",
@@ -391,7 +392,7 @@ public class AssemblyRotator
         Button bomBtn = new Button();
         bomBtn.Text = "Show BOM";
         bomBtn.Font = new Font("Segoe UI", 9, FontStyle.Bold);
-        bomBtn.Left = 455; bomBtn.Top = y - 2; bomBtn.Width = 140; bomBtn.Height = 28;
+        bomBtn.Left = 475; bomBtn.Top = y - 2; bomBtn.Width = 140; bomBtn.Height = 28;
         bomBtn.FlatStyle = FlatStyle.Flat;
         bomBtn.BackColor = Color.FromArgb(0,120,215); bomBtn.ForeColor = Color.White;
         bomBtn.FlatAppearance.BorderSize = 0;
@@ -400,45 +401,45 @@ public class AssemblyRotator
         bomBtn.BringToFront();
         y += 28;
         FL(form, "Constraints are suppressed before rotating and LEFT suppressed to hold position.",
-            form.Font, Color.Gray, lx, y, 570); y += 28;
-        HS(form, lx, y, cw); y += 12;
+            form.Font, Color.Gray, lx, y, 590); y += 24;
+        HS(form, lx, y, cw); y += 10;
 
         // BODY
         FL(form, "BODY  (fixed – will NOT move)",
             new Font("Segoe UI", 9, FontStyle.Bold), Color.FromArgb(0,100,200), lx, y, 400); y += 20;
         ComboBox bodyCombo = FC(form, allComps, lx, y, cw,
-            autoBody >= 0 ? autoBody : 0); y += 35;
+            autoBody >= 0 ? autoBody : 0); y += 32;
 
         // COVER
         FL(form, "COVER  (will be rotated)",
             new Font("Segoe UI", 9, FontStyle.Bold), Color.FromArgb(180,0,0), lx, y, 300); y += 20;
         ComboBox coverCombo = FC(form, allComps, lx, y, cw,
-            autoCover >= 0 ? autoCover : Math.Min(1, allComps.Count-1)); y += 28;
+            autoCover >= 0 ? autoCover : Math.Min(1, allComps.Count-1)); y += 26;
         FL(form, "Rotation angle:", form.Font, Color.Black, lx, y+3, 110);
-        TextBox coverAngleBox = FT(form, "0", lx+115, y, 80); y += 38;
+        TextBox coverAngleBox = FT(form, "0", lx+115, y, 80); y += 34;
 
         // OUTLET
         FL(form, "OUTLET  (will be rotated)",
             new Font("Segoe UI", 9, FontStyle.Bold), Color.FromArgb(0,130,0), lx, y, 300); y += 20;
         ComboBox outletCombo = FC(form, allComps, lx, y, cw,
-            autoOutlet >= 0 ? autoOutlet : Math.Min(2, allComps.Count-1)); y += 28;
+            autoOutlet >= 0 ? autoOutlet : Math.Min(2, allComps.Count-1)); y += 26;
         FL(form, "Rotation angle:", form.Font, Color.Black, lx, y+3, 110);
-        TextBox outletAngleBox = FT(form, "0", lx+115, y, 80); y += 38;
+        TextBox outletAngleBox = FT(form, "0", lx+115, y, 80); y += 34;
 
-        HS(form, lx, y, cw); y += 12;
+        HS(form, lx, y, cw); y += 10;
 
         // Axis
         FL(form, "Rotation Axis:", new Font("Segoe UI", 9, FontStyle.Bold), Color.Black, lx, y, 120);
         RadioButton radioZ = FR(form, "Z-Axis (vertical)", true,  140, y, 145);
         RadioButton radioX = FR(form, "X-Axis",           false, 290, y, 100);
         RadioButton radioY = FR(form, "Y-Axis",           false, 400, y, 100);
-        y += 36;
+        y += 32;
 
-        HS(form, lx, y, cw); y += 12;
+        HS(form, lx, y, cw); y += 10;
 
         // Pivot
         FL(form, "Rotation Axis Point  (auto-detected from body – override if wrong):",
-            new Font("Segoe UI", 9, FontStyle.Bold), Color.FromArgb(80,0,120), lx, y, 560); y += 22;
+            new Font("Segoe UI", 9, FontStyle.Bold), Color.FromArgb(80,0,120), lx, y, 580); y += 22;
         FL(form, "X:", form.Font, Color.Black, lx,      y+3, 18);
         TextBox pivX = FT(form, defaultPivot.X.ToString("F3"), lx+18,   y, 72);
         FL(form, "Y:", form.Font, Color.Black, lx+100,  y+3, 18);
@@ -446,58 +447,171 @@ public class AssemblyRotator
         FL(form, "Z:", form.Font, Color.Black, lx+200,  y+3, 18);
         TextBox pivZ = FT(form, defaultPivot.Z.ToString("F3"), lx+218,  y, 72);
         y += 30;
-        FL(form, "Tip: pivot = body center. Auto-detected via Component.GetPosition — override if wrong.",
-            form.Font, Color.Gray, lx, y, 560); y += 24;
-
-        HS(form, lx, y, cw); y += 12;
 
         // Restore checkbox
         CheckBox restoreChk = new CheckBox();
-        restoreChk.Text = "Restore constraints after rotation  " +
-                          "(WARNING: new position may revert)";
+        restoreChk.Text = "Restore constraints after each rotation  " +
+                          "(WARNING: position may revert; breaks clean Undo)";
         restoreChk.Left = lx; restoreChk.Top = y;
-        restoreChk.Width = 540; restoreChk.Checked = false;
+        restoreChk.Width = 600; restoreChk.Checked = false;
         restoreChk.ForeColor = Color.DarkRed;
-        form.Controls.Add(restoreChk); y += 32;
+        form.Controls.Add(restoreChk); y += 30;
 
-        // Buttons
-        Button okBtn = new Button();
-        okBtn.Text = "Apply Rotation";
-        okBtn.Font = new Font("Segoe UI", 10, FontStyle.Bold);
-        okBtn.BackColor = Color.FromArgb(0,120,215); okBtn.ForeColor = Color.White;
-        okBtn.FlatStyle = FlatStyle.Flat; okBtn.FlatAppearance.BorderSize = 0;
-        okBtn.Left = lx; okBtn.Top = y; okBtn.Width = 280; okBtn.Height = 42;
-        okBtn.DialogResult = DialogResult.OK;
-        form.Controls.Add(okBtn);
+        HS(form, lx, y, cw); y += 10;
 
-        Button cancelBtn = new Button();
-        cancelBtn.Text = "Cancel";
-        cancelBtn.Font = new Font("Segoe UI", 10);
-        cancelBtn.FlatStyle = FlatStyle.Flat;
-        cancelBtn.FlatAppearance.BorderColor = Color.FromArgb(180,180,180);
-        cancelBtn.Left = 313; cancelBtn.Top = y; cancelBtn.Width = 280; cancelBtn.Height = 42;
-        cancelBtn.DialogResult = DialogResult.Cancel;
-        form.Controls.Add(cancelBtn);
+        // Action buttons row
+        Button applyBtn = new Button();
+        applyBtn.Text = "Apply Rotation";
+        applyBtn.Font = new Font("Segoe UI", 10, FontStyle.Bold);
+        applyBtn.BackColor = Color.FromArgb(0,120,215); applyBtn.ForeColor = Color.White;
+        applyBtn.FlatStyle = FlatStyle.Flat; applyBtn.FlatAppearance.BorderSize = 0;
+        applyBtn.Left = lx; applyBtn.Top = y; applyBtn.Width = 210; applyBtn.Height = 40;
+        form.Controls.Add(applyBtn);
 
-        form.AcceptButton = okBtn; form.CancelButton = cancelBtn;
+        Button undoBtn = new Button();
+        undoBtn.Text = "Undo";
+        undoBtn.Font = new Font("Segoe UI", 9, FontStyle.Bold);
+        undoBtn.FlatStyle = FlatStyle.Flat;
+        undoBtn.FlatAppearance.BorderColor = Color.FromArgb(180,180,180);
+        undoBtn.BackColor = Color.FromArgb(245,245,245);
+        undoBtn.Left = 235; undoBtn.Top = y; undoBtn.Width = 95; undoBtn.Height = 40;
+        undoBtn.Enabled = false;
+        form.Controls.Add(undoBtn);
 
-        if (form.ShowDialog() != DialogResult.OK) { form.Dispose(); return false; }
+        Button redoBtn = new Button();
+        redoBtn.Text = "Redo";
+        redoBtn.Font = new Font("Segoe UI", 9, FontStyle.Bold);
+        redoBtn.FlatStyle = FlatStyle.Flat;
+        redoBtn.FlatAppearance.BorderColor = Color.FromArgb(180,180,180);
+        redoBtn.BackColor = Color.FromArgb(245,245,245);
+        redoBtn.Left = 338; redoBtn.Top = y; redoBtn.Width = 95; redoBtn.Height = 40;
+        redoBtn.Enabled = false;
+        form.Controls.Add(redoBtn);
 
-        bodyIdx   = bodyCombo.SelectedIndex;
-        coverIdx  = coverCombo.SelectedIndex;
-        outletIdx = outletCombo.SelectedIndex;
-        if (!double.TryParse(coverAngleBox.Text,  out coverAngle))  coverAngle  = 0;
-        if (!double.TryParse(outletAngleBox.Text, out outletAngle)) outletAngle = 0;
-        rotAxis = radioX.Checked ? "X" : (radioY.Checked ? "Y" : "Z");
-        double px2 = 0, py2 = 0, pz2 = 0;
-        double.TryParse(pivX.Text, out px2);
-        double.TryParse(pivY.Text, out py2);
-        double.TryParse(pivZ.Text, out pz2);
-        pivot = new Point3d(px2, py2, pz2);
-        restoreConstraints = restoreChk.Checked;
+        Button closeBtn = new Button();
+        closeBtn.Text = "Close";
+        closeBtn.Font = new Font("Segoe UI", 10);
+        closeBtn.FlatStyle = FlatStyle.Flat;
+        closeBtn.FlatAppearance.BorderColor = Color.FromArgb(180,180,180);
+        closeBtn.Left = 505; closeBtn.Top = y; closeBtn.Width = 110; closeBtn.Height = 40;
+        closeBtn.DialogResult = DialogResult.OK;
+        form.Controls.Add(closeBtn);
+        y += 48;
 
+        // Change-log panel
+        FL(form, "Change Log:", new Font("Segoe UI", 9, FontStyle.Bold), Color.Black, lx, y, 200); y += 20;
+        TextBox logBox = new TextBox();
+        logBox.Multiline = true; logBox.ReadOnly = true;
+        logBox.ScrollBars = ScrollBars.Vertical;
+        logBox.Font = new Font("Consolas", 8.5f);
+        logBox.BackColor = Color.FromArgb(250,250,250);
+        logBox.Left = lx; logBox.Top = y; logBox.Width = cw; logBox.Height = 150;
+        form.Controls.Add(logBox);
+        y += 158;
+
+        form.Height = y + 50;
+        form.AcceptButton = applyBtn;   // Enter applies (does not close)
+        form.CancelButton = closeBtn;
+
+        // ── Shared helpers (closures over the controls / stacks) ──
+        Action refreshButtons = delegate
+        {
+            undoBtn.Enabled = history.Count > 0;
+            redoBtn.Enabled = redo.Count > 0;
+        };
+
+        applyBtn.Click += delegate
+        {
+            string axis = radioX.Checked ? "X" : (radioY.Checked ? "Y" : "Z");
+
+            double px2 = 0, py2 = 0, pz2 = 0;
+            double.TryParse(pivX.Text, out px2);
+            double.TryParse(pivY.Text, out py2);
+            double.TryParse(pivZ.Text, out pz2);
+            Point3d pivot = new Point3d(px2, py2, pz2);
+
+            double coverAngle, outletAngle;
+            if (!double.TryParse(coverAngleBox.Text,  out coverAngle))  coverAngle  = 0;
+            if (!double.TryParse(outletAngleBox.Text, out outletAngle)) outletAngle = 0;
+
+            bool restore = restoreChk.Checked;
+
+            var applied = new List<string>();
+            if (coverAngle != 0)
+            {
+                RotationOp op = ApplyOneRotation(workPart,
+                    allComps[coverCombo.SelectedIndex].Comp, coverAngle, axis, pivot, restore);
+                history.Add(op); applied.Add(op.Description);
+                AppendLog(logBox, "APPLY  " + op.Description);
+            }
+            if (outletAngle != 0)
+            {
+                RotationOp op = ApplyOneRotation(workPart,
+                    allComps[outletCombo.SelectedIndex].Comp, outletAngle, axis, pivot, restore);
+                history.Add(op); applied.Add(op.Description);
+                AppendLog(logBox, "APPLY  " + op.Description);
+            }
+
+            if (applied.Count == 0)
+            {
+                MessageBox.Show("Both angles are 0 — nothing to rotate.",
+                    "Nothing applied", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            redo.Clear();           // a fresh action invalidates the redo branch
+            refreshButtons();
+
+            // Pop-up message block summarising what just changed.
+            string msg = "Applied " + applied.Count + " rotation(s):\n\n  " +
+                         string.Join("\n  ", applied.ToArray()) +
+                         "\n\nTotal operations this session: " + history.Count;
+            MessageBox.Show(msg, "Rotation Applied",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+        };
+
+        undoBtn.Click += delegate
+        {
+            if (history.Count == 0) return;
+            RotationOp op = history[history.Count - 1];
+            history.RemoveAt(history.Count - 1);
+            DoMove(workPart, op.Comp, -op.AngleDeg, op.Axis, op.Pivot, true);
+            redo.Add(op);
+            AppendLog(logBox, "UNDO   " + op.Description);
+            refreshButtons();
+        };
+
+        redoBtn.Click += delegate
+        {
+            if (redo.Count == 0) return;
+            RotationOp op = redo[redo.Count - 1];
+            redo.RemoveAt(redo.Count - 1);
+            DoMove(workPart, op.Comp, op.AngleDeg, op.Axis, op.Pivot, true);
+            history.Add(op);
+            AppendLog(logBox, "REDO   " + op.Description);
+            refreshButtons();
+        };
+
+        refreshButtons();
+        AppendLog(logBox, "Ready. Set angles and click Apply Rotation.");
+
+        form.ShowDialog();
         form.Dispose();
-        return true;
+
+        lw.WriteLine("");
+        lw.WriteLine("=== Session summary: " + history.Count +
+                     " net operation(s) applied ===");
+    }
+
+    // Append one timestamped line to the live log panel and mirror it to the
+    // NX Listing Window.
+    static void AppendLog(TextBox box, string line)
+    {
+        string stamp = DateTime.Now.ToString("HH:mm:ss");
+        box.AppendText(stamp + "  " + line + Environment.NewLine);
+        box.SelectionStart = box.TextLength;
+        box.ScrollToCaret();
+        lw.WriteLine(stamp + "  " + line);
     }
 
 
