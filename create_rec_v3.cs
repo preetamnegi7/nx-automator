@@ -142,6 +142,31 @@ public class AssemblyRotator
     static Matrix3x3 _bodyHomeMatrix;
     static bool      _bodyHomeSet;
 
+    // A tiny set of Tags, backed by a Dictionary.
+    //
+    // Why not HashSet<T>? HashSet<T> lives in System.Core.dll, which NX's
+    // journal Play compiler does NOT reference — only mscorlib is referenced.
+    // That is why List/Dictionary/Queue compile, why Action (always mscorlib)
+    // and Func<> (moved to mscorlib in .NET 4.0) compile, but HashSet<T> — which
+    // stayed in System.Core.dll — does not:
+    // "The type or namespace name 'HashSet' could not be found". This wrapper
+    // gives the HashSet behaviour we use (Add returning false on a duplicate,
+    // and Contains) without that missing reference. Do NOT replace it with
+    // HashSet — that reintroduces the build break.
+    class TagSet
+    {
+        Dictionary<Tag, bool> _d = new Dictionary<Tag, bool>();
+        // Returns true if newly added, false if the tag was already present
+        // (same semantics as HashSet<T>.Add).
+        public bool Add(Tag t)
+        {
+            if (_d.ContainsKey(t)) return false;
+            _d[t] = true;
+            return true;
+        }
+        public bool Contains(Tag t) { return _d.ContainsKey(t); }
+    }
+
     class CompInfo
     {
         public Component Comp;
@@ -477,7 +502,7 @@ public class AssemblyRotator
     // The walk stops at — and never crosses — anything excluded by tag or name
     // (body / cover / vac), so it cannot flood into the fixed body.
     static List<Component> CollectConnectedInPart(
-        Part scanPart, Component seed, HashSet<Tag> excludeTags, List<string> excludeNameKeys)
+        Part scanPart, Component seed, TagSet excludeTags, List<string> excludeNameKeys)
     {
         var compByTag = new Dictionary<Tag, Component>();
         var graph = BuildConstraintGraph(scanPart, compByTag);
@@ -493,7 +518,7 @@ public class AssemblyRotator
         }
 
         var result  = new List<Component>();
-        var visited = new HashSet<Tag>();
+        var visited = new TagSet();
         var queue   = new Queue<Tag>();
         visited.Add(seedTag);
         queue.Enqueue(seedTag);
@@ -964,7 +989,7 @@ public class AssemblyRotator
             {
                 Component outletSeed = allComps[outletCombo.SelectedIndex].Comp;
 
-                var excludeTags = new HashSet<Tag>();
+                var excludeTags = new TagSet();
                 excludeTags.Add(allComps[bodyCombo.SelectedIndex].Comp.Tag);
                 excludeTags.Add(allComps[coverCombo.SelectedIndex].Comp.Tag);
                 if (vacComp != null) excludeTags.Add(vacComp.Tag);
@@ -989,7 +1014,7 @@ public class AssemblyRotator
                 // Map each connected part back to its occurrence in the displayed
                 // tree (so it rotates through the same proven path as the outlet)
                 // and dedupe by prototype.
-                var seenProto = new HashSet<Tag>();
+                var seenProto = new TagSet();
                 foreach (Component rc in raw)
                 {
                     Component disp = MapToDisplayed(allComps, rc);
