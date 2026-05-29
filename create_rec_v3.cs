@@ -131,6 +131,27 @@
 //   The component for each reference is the movable object when it is a
 //   Component, else the geometry's NXObject.OwningComponent.
 //
+// v3.10 changes  (fix outlet "memory access violation" — back again, in the scan)
+// ───────────────────────────────────────────────────────────────────────────
+// * Symptom: clicking Apply with an outlet angle crashed NX instantly with
+//   "Internal error: memory access violation" — BEFORE the connectivity
+//   confirmation pop-up, so the crash was in the new scan, not in any move.
+// * Root cause: the scan dereferenced constraint GEOMETRY — GetGeometry() and
+//   then OwningComponent / IsOccurrence on a face/edge occurrence. In a
+//   partially-loaded assembly that is a native access violation, and a native
+//   AV is a Corrupted-State Exception that managed try/catch CANNOT trap, so it
+//   crashes NX outright. (SuppressAllConstraints never crashed because it only
+//   touches Constraint.Suppressed, never geometry.)
+// * Fix: CompOfRef now uses ONLY ConstraintReference.GetMovableObject() and a
+//   pure managed "as Component" test. It never calls GetGeometry() and never
+//   touches OwningComponent/IsOccurrence, so it cannot AV. The movable object of
+//   a component constraint is the component, which is the connectivity we need;
+//   a reference whose movable object is not a component just adds no edge.
+// * Added a crash-surviving FILE log (temp\nx_rotator_crash.log), flushed per
+//   line, plus per-constraint progress during the scan. If NX ever hard-crashes
+//   again, the file's LAST line is the exact constraint/step that did it. The
+//   in-dialog log now also force-repaints each line so progress is visible live.
+//
 // Usage: Open an assembly, then run via Tools -> Journal -> Play
 
 using System;
@@ -148,6 +169,12 @@ public class AssemblyRotator
 
     // The single change log. All messages go here (no NX Listing Window).
     static TextBox _logBox;
+
+    // Crash-surviving log. The in-dialog log lives in a TextBox that is lost if
+    // NX hard-crashes (e.g. a native access violation), and it does not even
+    // repaint mid-operation. This mirrors every log line to a file, flushed per
+    // line, so after a crash the file's LAST line is exactly where it died.
+    static string _crashLogPath;
 
     // Body reference lock: the body must ALWAYS stay in its reference position.
     // We remember its home placement and restore it after every operation so a
@@ -385,47 +412,31 @@ public class AssemblyRotator
     // IMPORTANT: build this graph BEFORE the constraints are suppressed — a
     // suppressed constraint no longer describes the connection we must follow.
 
-    // Resolve the assembly component a constraint reference belongs to.
+    // Resolve the assembly component a constraint reference is on.
     //
-    // NX Open API (verified against the NXOpen.Positioning reference):
-    //   * Constraint.GetReferences()            -> ConstraintReference[]
-    //   * ConstraintReference.GetMovableObject() -> NXObject  (the object being
-    //         positioned; for a component constraint this IS the component)
-    //   * ConstraintReference.GetGeometry()      -> NXObject  (the face/edge used
-    //         to define the constraint; its OwningComponent is the component)
+    // CRASH-SAFETY (this is what caused "Internal error: memory access violation"
+    // the instant the outlet scan started): we use ONLY the reference's movable
+    // object, and only when it is itself a Component. We deliberately do NOT call
+    // GetGeometry() and do NOT touch OwningComponent / IsOccurrence on the
+    // reference geometry. Dereferencing constraint geometry (a face/edge
+    // occurrence) in a partially-loaded assembly triggers a NATIVE access
+    // violation, and a native AV is a Corrupted-State Exception that a managed
+    // try/catch cannot trap — so it takes NX down instead of being swallowed.
     //
-    // We try the movable object first (most direct), then fall back to the
-    // geometry's owning component. Every call is guarded so a reference type we
-    // don't expect simply yields null instead of throwing.
+    // The movable object of a component constraint IS the component being
+    // positioned, which is exactly the component-to-component connectivity we
+    // need — and "obj as Component" is a pure managed type test that never calls
+    // into native NX, so it cannot AV. If a reference's movable object is not a
+    // Component (e.g. a grounded/auto reference), it simply contributes no edge.
+    //   * Constraint.GetReferences()             -> ConstraintReference[]
+    //   * ConstraintReference.GetMovableObject()  -> NXObject (the component)
     static Component CompOfRef(NXOpen.Positioning.ConstraintReference cr)
     {
         if (cr == null) return null;
-        Component c = ComponentOf(SafeMovable(cr));
-        if (c != null) return c;
-        return ComponentOf(SafeGeometry(cr));
-    }
-
-    static NXObject SafeMovable(NXOpen.Positioning.ConstraintReference cr)
-    {
-        try { return cr.GetMovableObject(); } catch { return null; }
-    }
-
-    static NXObject SafeGeometry(NXOpen.Positioning.ConstraintReference cr)
-    {
-        try { return cr.GetGeometry(); } catch { return null; }
-    }
-
-    // The component an object belongs to: the object itself if it is a component,
-    // otherwise its owning component when it is occurrence geometry (a face/edge
-    // inside a component). OwningComponent is null for non-occurrence objects.
-    static Component ComponentOf(NXObject obj)
-    {
-        if (obj == null) return null;
-        Component asComp = obj as Component;
-        if (asComp != null) return asComp;
-        try { if (obj.IsOccurrence) return obj.OwningComponent; } catch { }
-        try { return obj.OwningComponent; } catch { }
-        return null;
+        NXObject mov = null;
+        try { mov = cr.GetMovableObject(); }
+        catch { return null; }
+        return mov as Component;   // managed cast only — no native geometry deref
     }
 
     static void AddEdge(Dictionary<Tag, List<Tag>> graph, Tag a, Tag b)
@@ -440,7 +451,8 @@ public class AssemblyRotator
     }
 
     // Build an undirected component graph from every constraint in the part: two
-    // components share an edge if a constraint references geometry in both.
+    // components share an edge if a constraint positions both (their movable
+    // objects are connected). See CompOfRef for why we never touch geometry here.
     static Dictionary<Tag, List<Tag>> BuildConstraintGraph(
         Part scanPart, Dictionary<Tag, Component> compByTag)
     {
@@ -458,6 +470,9 @@ public class AssemblyRotator
                 if (c != null)
                 {
                     nConstraints++;
+                    // File-only progress: if a native AV still kills NX here, the
+                    // crash log's LAST line is the constraint that did it.
+                    CrashLog("    scan '" + SafePartName(scanPart) + "' constraint #" + nConstraints);
                     var comps = new List<Component>();
                     try
                     {
@@ -1158,6 +1173,7 @@ public class AssemblyRotator
                     foreach (Component f in outletFollowers)
                     {
                         if (f == outletComp) continue;
+                        AppendLog("Moving connected part: " + GetBestName(f));
                         if (MoveAround(workPart, f, outletAngle, axis, pivot, "Rotate outlet-attached part"))
                         {
                             RotationOp fop = MakeOp(f, outletAngle, axis, pivot);
@@ -1227,7 +1243,10 @@ public class AssemblyRotator
         };
 
         refreshButtons();
+        InitCrashLog();
         AppendLog("Ready. Set angles and click Apply Rotation.");
+        if (_crashLogPath != null)
+            AppendLog("Crash log (read this if NX crashes): " + _crashLogPath);
 
         form.ShowDialog();
         AppendLog("Session ended: " + history.Count + " net operation(s) applied.");
@@ -1239,11 +1258,44 @@ public class AssemblyRotator
     // Append one timestamped line to the single change-log panel.
     static void AppendLog(string line)
     {
+        CrashLog(line);   // persist first, so a line survives even a hard crash
         if (_logBox == null) return;
         string stamp = DateTime.Now.ToString("HH:mm:ss");
         _logBox.AppendText(stamp + "  " + line + Environment.NewLine);
         _logBox.SelectionStart = _logBox.TextLength;
         _logBox.ScrollToCaret();
+        // Force an immediate repaint of just this control so progress is visible
+        // before any long/blocking operation (and before a possible crash).
+        // Update() repaints without pumping input messages, so it cannot cause
+        // re-entrant button clicks the way Application.DoEvents() would.
+        try { _logBox.Update(); } catch { }
+    }
+
+    // Start a fresh crash log for this session (in the temp folder). Best-effort:
+    // if the file cannot be created, crash logging is simply disabled.
+    static void InitCrashLog()
+    {
+        try
+        {
+            _crashLogPath = System.IO.Path.Combine(
+                System.IO.Path.GetTempPath(), "nx_rotator_crash.log");
+            System.IO.File.WriteAllText(_crashLogPath,
+                "NX Assembly Component Rotator — session " + DateTime.Now + Environment.NewLine);
+        }
+        catch { _crashLogPath = null; }
+    }
+
+    // Append one line to the crash log, opening+closing the file each time so the
+    // line is flushed to disk immediately (survives a hard NX crash).
+    static void CrashLog(string line)
+    {
+        if (_crashLogPath == null) return;
+        try
+        {
+            System.IO.File.AppendAllText(_crashLogPath,
+                DateTime.Now.ToString("HH:mm:ss.fff") + "  " + line + Environment.NewLine);
+        }
+        catch { }
     }
 
 
