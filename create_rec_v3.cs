@@ -79,7 +79,7 @@
 // * Fix (MoveInContext): a nested component is now moved inside its own owning
 //   subassembly via Component.DirectOwner. The component reference is mapped in
 //   with ComponentAssembly.MapComponentFromParent, and the world-frame rotation
-//   is mapped into that subassembly's local frame (R_local = Mbᵀ·R·Mb, with a
+//   is mapped into that subassembly's local frame (using NX row-axis matrices, with a
 //   matching translation) so it rotates about the correct world axis/pivot.
 // * Top-level components (cover, body) are unaffected and move exactly as before.
 //
@@ -151,6 +151,15 @@
 //   line, plus per-constraint progress during the scan. If NX ever hard-crashes
 //   again, the file's LAST line is the exact constraint/step that did it. The
 //   in-dialog log now also force-repaints each line so progress is visible live.
+//
+// v3.11 changes  (make rotation frame universal)
+// * "X/Y/Z" can now be resolved from the BODY reference axes, the rotating
+//   component axes, or absolute assembly axes. BODY axes are the default because
+//   the body is the fixed reference in these air-cleaner assemblies.
+// * Rotation now supports an arbitrary axis vector, not only absolute XYZ.
+// * Corrected nested subassembly transform mapping for NX Matrix3x3 row-axis
+//   convention. Non-identity parent subassemblies no longer get the wrong local
+//   move matrix, which caused outlet/cover variants to drift in other designs.
 //
 // Usage: Open an assembly, then run via Tools -> Journal -> Play
 
@@ -236,6 +245,9 @@ public class AssemblyRotator
         public string CompName;
         public double AngleDeg;
         public string Axis;
+        public double AxisX;
+        public double AxisY;
+        public double AxisZ;
         public Point3d Pivot;
         public string Description;
     }
@@ -310,31 +322,98 @@ public class AssemblyRotator
         return new Point3d(0, 0, 0);
     }
 
-    // 3×3 rotation matrix as double[row, col]
+    // 3x3 rotation matrix as double[row, col]
     static double[,] BuildDR(double angleDeg, string axis)
+    {
+        double ax = 0, ay = 0, az = 1;
+        if (axis == "X") { ax = 1; ay = 0; az = 0; }
+        else if (axis == "Y") { ax = 0; ay = 1; az = 0; }
+        return BuildAxisDR(angleDeg, ax, ay, az);
+    }
+
+    // 3x3 rotation matrix about any unit/non-unit axis vector in assembly
+    // coordinates. This is Rodrigues' formula.
+    static double[,] BuildAxisDR(double angleDeg, double ax, double ay, double az)
     {
         double a = angleDeg * Math.PI / 180.0;
         double c = Math.Cos(a), s = Math.Sin(a);
+        double len = Math.Sqrt(ax*ax + ay*ay + az*az);
+        if (len < 1e-9) { ax = 0; ay = 0; az = 1; len = 1; }
+        ax /= len; ay /= len; az /= len;
+
+        double t = 1.0 - c;
         double[,] dR = new double[3, 3];
+        dR[0,0] = t*ax*ax + c;
+        dR[0,1] = t*ax*ay - s*az;
+        dR[0,2] = t*ax*az + s*ay;
+        dR[1,0] = t*ax*ay + s*az;
+        dR[1,1] = t*ay*ay + c;
+        dR[1,2] = t*ay*az - s*ax;
+        dR[2,0] = t*ax*az - s*ay;
+        dR[2,1] = t*ay*az + s*ax;
+        dR[2,2] = t*az*az + c;
+        return dR;
+    }
+
+    static double[] AssemblyAxisVector(string axis)
+    {
         switch (axis)
         {
-            case "X":
-                dR[0,0]=1; dR[0,1]=0;  dR[0,2]=0;
-                dR[1,0]=0; dR[1,1]=c;  dR[1,2]=-s;
-                dR[2,0]=0; dR[2,1]=s;  dR[2,2]=c;
-                break;
-            case "Y":
-                dR[0,0]=c;  dR[0,1]=0; dR[0,2]=s;
-                dR[1,0]=0;  dR[1,1]=1; dR[1,2]=0;
-                dR[2,0]=-s; dR[2,1]=0; dR[2,2]=c;
-                break;
-            default: // Z
-                dR[0,0]=c;  dR[0,1]=-s; dR[0,2]=0;
-                dR[1,0]=s;  dR[1,1]=c;  dR[1,2]=0;
-                dR[2,0]=0;  dR[2,1]=0;  dR[2,2]=1;
-                break;
+            case "X": return new double[] { 1, 0, 0 };
+            case "Y": return new double[] { 0, 1, 0 };
+            default:  return new double[] { 0, 0, 1 };
         }
-        return dR;
+    }
+
+    static double[] NormalizeAxis(double x, double y, double z)
+    {
+        double len = Math.Sqrt(x*x + y*y + z*z);
+        if (len < 1e-9) return new double[] { 0, 0, 1 };
+        return new double[] { x/len, y/len, z/len };
+    }
+
+    // NX Matrix3x3 rows are the component's X/Y/Z axis vectors in the parent
+    // assembly coordinate system.
+    static double[] AxisVectorFromMatrix(Matrix3x3 m, string axis)
+    {
+        switch (axis)
+        {
+            case "X": return NormalizeAxis(m.Xx, m.Xy, m.Xz);
+            case "Y": return NormalizeAxis(m.Yx, m.Yy, m.Yz);
+            default:  return NormalizeAxis(m.Zx, m.Zy, m.Zz);
+        }
+    }
+
+    static double[] ComponentAxisVector(Component comp, string axis)
+    {
+        if (comp == null) return AssemblyAxisVector(axis);
+        try
+        {
+            Point3d origin;
+            Matrix3x3 orientation;
+            comp.GetPosition(out origin, out orientation);
+            return AxisVectorFromMatrix(orientation, axis);
+        }
+        catch { }
+        return AssemblyAxisVector(axis);
+    }
+
+    static double[] ResolveAxisVector(string axis, string frame,
+        Component bodyComp, Component targetComp)
+    {
+        if (frame == "Rotating component axes")
+            return ComponentAxisVector(targetComp, axis);
+        if (frame == "Assembly absolute axes")
+            return AssemblyAxisVector(axis);
+        return ComponentAxisVector(bodyComp, axis);
+    }
+
+    static string AxisVecText(double[] v)
+    {
+        if (v == null || v.Length < 3) return "(0.000, 0.000, 1.000)";
+        return "(" + v[0].ToString("F3") + ", " +
+                     v[1].ToString("F3") + ", " +
+                     v[2].ToString("F3") + ")";
     }
 
     static Matrix3x3 ToNXMatrix(double[,] dR)
@@ -760,12 +839,13 @@ public class AssemblyRotator
             double[,] Mb  = MatOf(Mbn);
             double[,] MbT = Transpose(Mb);
 
-            // R_local = Mbᵀ · Rw · Mb
-            R = MatMul(MatMul(MbT, Rw), Mb);
+            // NX Matrix3x3 stores component axes as rows. Parent-to-local is
+            // Mb and local-to-parent is Mb^T, so R_local = Mb * Rw * Mb^T.
+            R = MatMul(MatMul(Mb, Rw), MbT);
 
-            // delta_local = Mbᵀ · (Rw·Ob + worldDelta − Ob)
+            // delta_local = Mb * (Rw*Ob + worldDelta - Ob)
             double[] rwOb = MatVec(Rw, Ob.X, Ob.Y, Ob.Z);
-            double[] dl = MatVec(MbT,
+            double[] dl = MatVec(Mb,
                 rwOb[0] + worldDelta.X - Ob.X,
                 rwOb[1] + worldDelta.Y - Ob.Y,
                 rwOb[2] + worldDelta.Z - Ob.Z);
@@ -793,6 +873,15 @@ public class AssemblyRotator
         double angleDeg, string axis, Point3d pivot, string label)
     {
         double[,] dR = BuildDR(angleDeg, axis);
+        Vector3d delta = ComputeDelta(dR, pivot);
+        return MoveInContext(topPart, comp, delta, dR, label, true);
+    }
+
+    // Rotate one component around an arbitrary assembly-space axis vector.
+    static bool MoveAroundAxis(Part topPart, Component comp,
+        double angleDeg, double ax, double ay, double az, Point3d pivot, string label)
+    {
+        double[,] dR = BuildAxisDR(angleDeg, ax, ay, az);
         Vector3d delta = ComputeDelta(dR, pivot);
         return MoveInContext(topPart, comp, delta, dR, label, true);
     }
@@ -828,15 +917,22 @@ public class AssemblyRotator
     }
 
     // Build the undo/redo record for a rotation that was applied.
-    static RotationOp MakeOp(Component comp, double angleDeg, string axis, Point3d pivot)
+    static RotationOp MakeOp(Component comp, double angleDeg, string axis,
+        double[] axisVec, Point3d pivot)
     {
         RotationOp op = new RotationOp();
         op.Comp = comp;
         op.CompName = GetBestName(comp);
         op.AngleDeg = angleDeg;
         op.Axis = axis;
+        if (axisVec == null || axisVec.Length < 3)
+            axisVec = AssemblyAxisVector(axis);
+        op.AxisX = axisVec[0];
+        op.AxisY = axisVec[1];
+        op.AxisZ = axisVec[2];
         op.Pivot = pivot;
         op.Description = op.CompName + "   " + angleDeg + " deg about " + axis +
+            " axis " + AxisVecText(axisVec) +
             "   pivot(" + pivot.X.ToString("F1") + ", " +
             pivot.Y.ToString("F1") + ", " + pivot.Z.ToString("F1") + ")";
         return op;
@@ -918,7 +1014,7 @@ public class AssemblyRotator
 
         Form form = new Form();
         form.Text = "Assembly Component Rotator v3";
-        form.Width = 650; form.Height = 760;
+        form.Width = 650; form.Height = 800;
         form.StartPosition = FormStartPosition.CenterScreen;
         form.TopMost = true;
         form.FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -997,10 +1093,21 @@ public class AssemblyRotator
 
         // Axis
         FL(form, "Rotation Axis:", new Font("Segoe UI", 9, FontStyle.Bold), Color.Black, lx, y, 120);
-        RadioButton radioZ = FR(form, "Z-Axis (vertical)", true,  140, y, 145);
+        RadioButton radioZ = FR(form, "Z-Axis", true,  140, y, 145);
         RadioButton radioX = FR(form, "X-Axis",           false, 290, y, 100);
         RadioButton radioY = FR(form, "Y-Axis",           false, 400, y, 100);
         y += 32;
+
+        FL(form, "Axis reference:", new Font("Segoe UI", 9, FontStyle.Bold), Color.Black, lx, y+3, 120);
+        ComboBox axisFrameCombo = new ComboBox();
+        axisFrameCombo.DropDownStyle = ComboBoxStyle.DropDownList;
+        axisFrameCombo.Left = 140; axisFrameCombo.Top = y; axisFrameCombo.Width = 270;
+        axisFrameCombo.Items.Add("Body reference axes");
+        axisFrameCombo.Items.Add("Rotating component axes");
+        axisFrameCombo.Items.Add("Assembly absolute axes");
+        axisFrameCombo.SelectedIndex = 0;
+        form.Controls.Add(axisFrameCombo);
+        y += 30;
 
         // Pivot
         FL(form, "Rotation Axis Point  (auto-detected from body – override if wrong):",
@@ -1216,19 +1323,28 @@ public class AssemblyRotator
             {
                 CompInfo ci = allComps[coverCombo.SelectedIndex];
                 AppendLog("Cover target: " + ci.FullName + "  (tree level " + ci.Level + ")");
+                string axisFrame = axisFrameCombo.SelectedItem.ToString();
+                Component bodyComp = allComps[bodyCombo.SelectedIndex].Comp;
                 Component coverComp = ci.Comp;
-                if (MoveAround(workPart, coverComp, coverAngle, axis, pivot, "Rotate cover"))
+                double[] coverAxisVec = ResolveAxisVector(axis, axisFrame, bodyComp, coverComp);
+                AppendLog("Cover axis: " + axis + " from " + axisFrame + " " +
+                          AxisVecText(coverAxisVec));
+                if (MoveAroundAxis(workPart, coverComp, coverAngle,
+                    coverAxisVec[0], coverAxisVec[1], coverAxisVec[2],
+                    pivot, "Rotate cover"))
                 {
-                    RotationOp op = MakeOp(coverComp, coverAngle, axis, pivot);
+                    RotationOp op = MakeOp(coverComp, coverAngle, axis, coverAxisVec, pivot);
                     newOps.Add(op); applied.Add(op.Description);
                     AppendLog("APPLY  " + op.Description);
 
                     // Vac valve ALWAYS follows the cover: same angle/axis/pivot.
                     if (vacComp != null && vacComp != coverComp)
                     {
-                        if (MoveAround(workPart, vacComp, coverAngle, axis, pivot, "Rotate vac valve"))
+                        if (MoveAroundAxis(workPart, vacComp, coverAngle,
+                            coverAxisVec[0], coverAxisVec[1], coverAxisVec[2],
+                            pivot, "Rotate vac valve"))
                         {
-                            RotationOp vop = MakeOp(vacComp, coverAngle, axis, pivot);
+                            RotationOp vop = MakeOp(vacComp, coverAngle, axis, coverAxisVec, pivot);
                             newOps.Add(vop); applied.Add(vop.Description + "  [with cover]");
                             AppendLog("APPLY  " + vop.Description + "  [with cover]");
                         }
@@ -1244,10 +1360,17 @@ public class AssemblyRotator
             {
                 CompInfo oi = allComps[outletCombo.SelectedIndex];
                 AppendLog("Outlet target: " + oi.FullName + "  (tree level " + oi.Level + ")");
+                string axisFrame = axisFrameCombo.SelectedItem.ToString();
+                Component bodyComp = allComps[bodyCombo.SelectedIndex].Comp;
                 Component outletComp = oi.Comp;
-                if (MoveAround(workPart, outletComp, outletAngle, axis, pivot, "Rotate outlet"))
+                double[] outletAxisVec = ResolveAxisVector(axis, axisFrame, bodyComp, outletComp);
+                AppendLog("Outlet axis: " + axis + " from " + axisFrame + " " +
+                          AxisVecText(outletAxisVec));
+                if (MoveAroundAxis(workPart, outletComp, outletAngle,
+                    outletAxisVec[0], outletAxisVec[1], outletAxisVec[2],
+                    pivot, "Rotate outlet"))
                 {
-                    RotationOp op = MakeOp(outletComp, outletAngle, axis, pivot);
+                    RotationOp op = MakeOp(outletComp, outletAngle, axis, outletAxisVec, pivot);
                     newOps.Add(op); applied.Add(op.Description);
                     AppendLog("APPLY  " + op.Description);
 
@@ -1257,9 +1380,11 @@ public class AssemblyRotator
                     {
                         if (f == outletComp) continue;
                         AppendLog("Moving connected part: " + GetBestName(f));
-                        if (MoveAround(workPart, f, outletAngle, axis, pivot, "Rotate outlet-attached part"))
+                        if (MoveAroundAxis(workPart, f, outletAngle,
+                            outletAxisVec[0], outletAxisVec[1], outletAxisVec[2],
+                            pivot, "Rotate outlet-attached part"))
                         {
-                            RotationOp fop = MakeOp(f, outletAngle, axis, pivot);
+                            RotationOp fop = MakeOp(f, outletAngle, axis, outletAxisVec, pivot);
                             newOps.Add(fop); applied.Add(fop.Description + "  [with outlet]");
                             AppendLog("APPLY  " + fop.Description + "  [with outlet]");
                         }
@@ -1304,7 +1429,8 @@ public class AssemblyRotator
             if (history.Count == 0) return;
             RotationOp op = history[history.Count - 1];
             SuppressAllConstraints(workPart);
-            if (!MoveAround(workPart, op.Comp, -op.AngleDeg, op.Axis, op.Pivot, "Undo rotate")) return;
+            if (!MoveAroundAxis(workPart, op.Comp, -op.AngleDeg,
+                op.AxisX, op.AxisY, op.AxisZ, op.Pivot, "Undo rotate")) return;
             RestoreBody(workPart);
             history.RemoveAt(history.Count - 1);
             redo.Add(op);
@@ -1317,7 +1443,8 @@ public class AssemblyRotator
             if (redo.Count == 0) return;
             RotationOp op = redo[redo.Count - 1];
             SuppressAllConstraints(workPart);
-            if (!MoveAround(workPart, op.Comp, op.AngleDeg, op.Axis, op.Pivot, "Redo rotate")) return;
+            if (!MoveAroundAxis(workPart, op.Comp, op.AngleDeg,
+                op.AxisX, op.AxisY, op.AxisZ, op.Pivot, "Redo rotate")) return;
             RestoreBody(workPart);
             redo.RemoveAt(redo.Count - 1);
             history.Add(op);
@@ -1400,9 +1527,9 @@ public class AssemblyRotator
         catch { }
     }
 
-    // Force the body back to its captured reference placement. The incremental
-    // transform that maps the body's current placement (curO, curM) back to its
-    // home (homeO, homeM) is:  R = homeM * curM^T ,  t = homeO - R * curO.
+    // Force the body back to its captured reference placement. NX Matrix3x3
+    // stores axis vectors as rows, so the incremental transform that maps the
+    // current placement back home is R = homeRows^T * curRows.
     static void RestoreBody(Part workPart)
     {
         if (!_bodyHomeSet || _bodyComp == null) return;
@@ -1411,7 +1538,9 @@ public class AssemblyRotator
             Point3d curO; Matrix3x3 curM;
             _bodyComp.GetPosition(out curO, out curM);
 
-            double[,] R  = MatMul(MatOf(_bodyHomeMatrix), Transpose(MatOf(curM)));
+            double[,] curRows  = MatOf(curM);
+            double[,] homeRows = MatOf(_bodyHomeMatrix);
+            double[,] R  = MatMul(Transpose(homeRows), curRows);
             double[]  rc = MatVec(R, curO.X, curO.Y, curO.Z);
             Vector3d  t  = new Vector3d(_bodyHomeOrigin.X - rc[0],
                                         _bodyHomeOrigin.Y - rc[1],
@@ -1435,6 +1564,7 @@ public class AssemblyRotator
 
     static double[,] MatOf(Matrix3x3 m)
     {
+        // Rows are the component X/Y/Z axis vectors in NX Matrix3x3.
         return new double[3,3] {
             { m.Xx, m.Xy, m.Xz },
             { m.Yx, m.Yy, m.Yz },
