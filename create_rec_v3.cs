@@ -161,6 +161,17 @@
 //   convention. Non-identity parent subassemblies no longer get the wrong local
 //   move matrix, which caused outlet/cover variants to drift in other designs.
 //
+// v3.12 changes  (stop axial drift + avoid raw nested MoveComponent crash)
+// * The actual move engine now tries ComponentPositioner / ComponentNetwork
+//   first, matching NX's interactive Move Component path more closely.
+// * Nested components do NOT fall back to raw ComponentAssembly.MoveComponent,
+//   because that is the path that can raise "Internal error: memory access
+//   violation" on some outlet subassemblies.
+// * After each rotation, the tool checks movement along the selected axis and
+//   translates the component back along that axis if NX introduced drift.
+// * Outlet connected-part detection is now optional and off by default, so a
+//   fragile constraint graph cannot crash a simple outlet-only rotation.
+//
 // Usage: Open an assembly, then run via Tools -> Journal -> Play
 
 using System;
@@ -169,6 +180,7 @@ using System.Drawing;
 using System.Windows.Forms;
 using NXOpen;
 using NXOpen.Assemblies;
+using NXOpen.Positioning;
 using NXOpen.UF;
 
 public class AssemblyRotator
@@ -370,6 +382,42 @@ public class AssemblyRotator
         double len = Math.Sqrt(x*x + y*y + z*z);
         if (len < 1e-9) return new double[] { 0, 0, 1 };
         return new double[] { x/len, y/len, z/len };
+    }
+
+    static double DotAxis(double[] axis, Point3d p)
+    {
+        return axis[0]*p.X + axis[1]*p.Y + axis[2]*p.Z;
+    }
+
+    static double DotAxis(double[] axis, Vector3d v)
+    {
+        return axis[0]*v.X + axis[1]*v.Y + axis[2]*v.Z;
+    }
+
+    static Vector3d ScaleAxis(double[] axis, double scale)
+    {
+        return new Vector3d(axis[0]*scale, axis[1]*scale, axis[2]*scale);
+    }
+
+    static double[,] Identity3()
+    {
+        return new double[3,3] {
+            { 1, 0, 0 },
+            { 0, 1, 0 },
+            { 0, 0, 1 } };
+    }
+
+    static bool TryGetPosition(Component comp, out Point3d origin, out Matrix3x3 orientation)
+    {
+        origin = new Point3d(0, 0, 0);
+        orientation = new Matrix3x3();
+        if (comp == null) return false;
+        try
+        {
+            comp.GetPosition(out origin, out orientation);
+            return true;
+        }
+        catch { return false; }
     }
 
     // NX Matrix3x3 rows are the component's X/Y/Z axis vectors in the parent
@@ -774,15 +822,56 @@ public class AssemblyRotator
     // ─── Core rotation ────────────────────────────────────────────────────────
 
     // Low-level move: rotate/translate one component, then immediately run an
-    // NX update bracketed by an undo mark. Updating after EVERY move is what
-    // keeps repeated MoveComponent calls from corrupting NX's internal state
-    // (the "Internal error: memory access violation" crash). Returns false and
-    // reports once if the move fails.
-    // Lowest level: do the actual MoveComponent on a specific ComponentAssembly,
-    // bracketed by an undo mark + NX update so repeated moves stay stable.
-    static bool MoveRaw(ComponentAssembly asm, Component comp, Vector3d delta,
-        double[,] R, string label, bool loud)
+    // NX update bracketed by an undo mark. ComponentNetwork is tried first
+    // because it follows the interactive Move Component engine and is safer for
+    // assemblies whose raw MoveComponent path throws an internal memory error.
+    static bool TryMoveWithNetwork(ComponentAssembly asm, Component comp,
+        Vector3d delta, double[,] R, string label, out string error)
     {
+        error = "";
+        ComponentPositioner positioner = null;
+        ComponentNetwork network = null;
+
+        try
+        {
+            NXOpen.Session.UndoMarkId mk =
+                theSession.SetUndoMark(NXOpen.Session.MarkVisibility.Invisible, label);
+
+            positioner = asm.Positioner;
+            positioner.ClearNetwork();
+            positioner.BeginMoveComponent();
+
+            network = (ComponentNetwork)positioner.EstablishNetwork();
+            network.SetMovingGroup(new NXObject[] { comp });
+            network.NonMovingGroupGrounded = true;
+
+            network.BeginDrag();
+            network.DragByTransform(delta, ToNXMatrix(R));
+            network.EndDrag();
+            network.Solve();
+            network.ApplyToModel();
+
+            theSession.UpdateManager.DoUpdate(mk);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            return false;
+        }
+        finally
+        {
+            try { if (positioner != null) positioner.ClearNetwork(); } catch { }
+            try { if (positioner != null) positioner.EndMoveComponent(); } catch { }
+        }
+    }
+
+    // Raw ComponentAssembly.MoveComponent fallback. This is not used for nested
+    // components because some outlet subassemblies crash in native NX code here.
+    static bool TryMoveRawComponent(ComponentAssembly asm, Component comp,
+        Vector3d delta, double[,] R, string label, out string error)
+    {
+        error = "";
         try
         {
             NXOpen.Session.UndoMarkId mk =
@@ -793,22 +882,51 @@ public class AssemblyRotator
         }
         catch (Exception ex)
         {
-            if (loud)
-            {
-                string nm = GetBestName(comp);
-                AppendLog("MoveComponent FAILED on '" + nm + "': " + ex.Message);
-                MessageBox.Show(
-                    "Could not rotate:\n   " + nm + "\n\n" + ex.Message + "\n\n" +
-                    "The component's part may be read-only or not fully loaded. Fully load " +
-                    "the assembly (or open the owning subassembly) and try again.",
-                    "Rotation failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
-            else
-            {
-                AppendLog("Body lock could not correct drift (" + ex.Message + ").");
-            }
+            error = ex.Message;
             return false;
         }
+    }
+
+    // Lowest level: do the actual move on a specific ComponentAssembly.
+    static bool MoveRaw(ComponentAssembly asm, Component comp, Vector3d delta,
+        double[,] R, string label, bool loud, bool allowRawFallback)
+    {
+        string networkError;
+        if (TryMoveWithNetwork(asm, comp, delta, R, label, out networkError))
+            return true;
+
+        AppendLog("ComponentNetwork move failed on '" + GetBestName(comp) +
+                  "': " + networkError);
+
+        if (allowRawFallback)
+        {
+            string rawError;
+            if (TryMoveRawComponent(asm, comp, delta, R, label, out rawError))
+            {
+                AppendLog("Raw MoveComponent fallback succeeded.");
+                return true;
+            }
+            networkError = networkError + "; raw fallback: " + rawError;
+        }
+        else
+        {
+            AppendLog("Raw MoveComponent fallback skipped for nested component.");
+        }
+
+        if (loud)
+        {
+            string nm = GetBestName(comp);
+            AppendLog("Move FAILED on '" + nm + "': " + networkError);
+            MessageBox.Show(
+                "Could not rotate:\n   " + nm + "\n\n" + networkError + "\n\n" +
+                "Fully load the assembly (or open the owning subassembly) and try again.",
+                "Rotation failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        else
+        {
+            AppendLog("Body lock could not correct drift (" + networkError + ").");
+        }
+        return false;
     }
 
     // Move a component that may be nested. ComponentAssembly.MoveComponent only
@@ -825,7 +943,7 @@ public class AssemblyRotator
 
         bool topLevel = (owner.Tag == topPart.ComponentAssembly.Tag);
         if (topLevel)
-            return MoveRaw(owner, comp, worldDelta, Rw, label, loud);
+            return MoveRaw(owner, comp, worldDelta, Rw, label, loud, true);
 
         // Nested: map the transform from world into the owning subassembly frame.
         Vector3d delta = worldDelta;
@@ -865,25 +983,52 @@ public class AssemblyRotator
         catch { }
 
         AppendLog("(nested component — moving inside its subassembly)");
-        return MoveRaw(owner, target, delta, R, label, loud);
+        return MoveRaw(owner, target, delta, R, label, loud, false);
     }
 
     // Rotate one component by angleDeg about the given axis, around the pivot.
     static bool MoveAround(Part topPart, Component comp,
         double angleDeg, string axis, Point3d pivot, string label)
     {
-        double[,] dR = BuildDR(angleDeg, axis);
-        Vector3d delta = ComputeDelta(dR, pivot);
-        return MoveInContext(topPart, comp, delta, dR, label, true);
+        double[] axisVec = AssemblyAxisVector(axis);
+        return MoveAroundAxis(topPart, comp, angleDeg,
+            axisVec[0], axisVec[1], axisVec[2], pivot, label);
     }
 
     // Rotate one component around an arbitrary assembly-space axis vector.
     static bool MoveAroundAxis(Part topPart, Component comp,
         double angleDeg, double ax, double ay, double az, Point3d pivot, string label)
     {
-        double[,] dR = BuildAxisDR(angleDeg, ax, ay, az);
+        double[] axisVec = NormalizeAxis(ax, ay, az);
+        Point3d beforeOrigin;
+        Matrix3x3 beforeMatrix;
+        bool haveBefore = TryGetPosition(comp, out beforeOrigin, out beforeMatrix);
+
+        double[,] dR = BuildAxisDR(angleDeg, axisVec[0], axisVec[1], axisVec[2]);
         Vector3d delta = ComputeDelta(dR, pivot);
-        return MoveInContext(topPart, comp, delta, dR, label, true);
+        if (!MoveInContext(topPart, comp, delta, dR, label, true))
+            return false;
+
+        // A true rotation about an axis does not change the component's
+        // coordinate along that axis. Some assembly variants still solve a small
+        // axial translation into the move, so remove that drift immediately.
+        Point3d afterOrigin;
+        Matrix3x3 afterMatrix;
+        if (haveBefore && TryGetPosition(comp, out afterOrigin, out afterMatrix))
+        {
+            double drift = DotAxis(axisVec, afterOrigin) - DotAxis(axisVec, beforeOrigin);
+            if (Math.Abs(drift) > 0.001)
+            {
+                AppendLog(label + " axial drift " + drift.ToString("F4") +
+                          "; correcting along axis " + AxisVecText(axisVec));
+                Vector3d correction = ScaleAxis(axisVec, -drift);
+                if (!MoveInContext(topPart, comp, correction, Identity3(),
+                    label + " axis lock", true))
+                    return false;
+            }
+        }
+
+        return true;
     }
 
     // Validate that a rotation angle is a whole multiple of its step angle.
@@ -1088,6 +1233,11 @@ public class AssemblyRotator
         TextBox outletStepBox = FT(form, "", lx+315, y, 70); y += 24;
         FL(form, "Multiple of its step angle. All parts constrained to the outlet rotate with it.",
             form.Font, Color.Gray, lx, y, 590); y += 26;
+        CheckBox outletFollowersChk = new CheckBox();
+        outletFollowersChk.Text = "Auto-detect and rotate outlet-connected parts";
+        outletFollowersChk.Left = lx; outletFollowersChk.Top = y;
+        outletFollowersChk.Width = 420; outletFollowersChk.Checked = false;
+        form.Controls.Add(outletFollowersChk); y += 26;
 
         HS(form, lx, y, cw); y += 10;
 
@@ -1232,7 +1382,7 @@ public class AssemblyRotator
             // assembly — and the body / cover / vac are excluded by tag AND by
             // name so the walk can never flood into the fixed body.
             List<Component> outletFollowers = new List<Component>();
-            if (outletAngle != 0)
+            if (outletAngle != 0 && outletFollowersChk.Checked)
             {
                 Component outletSeed = allComps[outletCombo.SelectedIndex].Comp;
 
@@ -1303,6 +1453,10 @@ public class AssemblyRotator
                         AppendLog("Rotating outlet only (connected parts skipped by user).");
                     }
                 }
+            }
+            else if (outletAngle != 0)
+            {
+                AppendLog("Outlet connected-part scan skipped; rotating selected outlet only.");
             }
 
             // After an outlet-only cancel there may be nothing left to rotate.
@@ -1391,7 +1545,6 @@ public class AssemblyRotator
                     }
                 }
             }
-
             RestoreBody(workPart);  // body stays in its reference position
 
             if (restore && suppressed.Count > 0)
