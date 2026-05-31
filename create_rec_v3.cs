@@ -169,8 +169,12 @@
 //   violation" on some outlet subassemblies.
 // * After each rotation, the tool checks movement along the selected axis and
 //   translates the component back along that axis if NX introduced drift.
-// * Outlet connected-part detection is now optional and off by default, so a
-//   fragile constraint graph cannot crash a simple outlet-only rotation.
+// * Outlet connected-part detection is optional; leave it on for rigid attached
+//   parts, or switch it off if a fragile constraint graph blocks a simple move.
+// * Cover+vac and outlet+attached parts are moved as rigid ComponentNetwork
+//   groups instead of sequential single-component moves.
+// * Step angle is optional: blank/0 allows any angle; positive values enforce
+//   indexed-position multiples.
 //
 // Usage: Open an assembly, then run via Tools -> Journal -> Play
 
@@ -828,6 +832,13 @@ public class AssemblyRotator
     static bool TryMoveWithNetwork(ComponentAssembly asm, Component comp,
         Vector3d delta, double[,] R, string label, out string error)
     {
+        return TryMoveGroupWithNetwork(asm, new NXObject[] { comp },
+            GetBestName(comp), delta, R, label, out error);
+    }
+
+    static bool TryMoveGroupWithNetwork(ComponentAssembly asm, NXObject[] movingGroup,
+        string groupName, Vector3d delta, double[,] R, string label, out string error)
+    {
         error = "";
         ComponentPositioner positioner = null;
         ComponentNetwork network = null;
@@ -842,7 +853,7 @@ public class AssemblyRotator
             positioner.BeginMoveComponent();
 
             network = (ComponentNetwork)positioner.EstablishNetwork();
-            network.SetMovingGroup(new NXObject[] { comp });
+            network.SetMovingGroup(movingGroup);
             network.NonMovingGroupGrounded = true;
 
             network.BeginDrag();
@@ -864,6 +875,27 @@ public class AssemblyRotator
             try { if (positioner != null) positioner.ClearNetwork(); } catch { }
             try { if (positioner != null) positioner.EndMoveComponent(); } catch { }
         }
+    }
+
+    static bool MoveRawGroup(ComponentAssembly asm, NXObject[] movingGroup,
+        string groupName, Vector3d delta, double[,] R, string label, bool loud)
+    {
+        string networkError;
+        if (TryMoveGroupWithNetwork(asm, movingGroup, groupName,
+            delta, R, label, out networkError))
+            return true;
+
+        AppendLog("ComponentNetwork group move failed on '" + groupName +
+                  "': " + networkError);
+
+        if (loud)
+        {
+            MessageBox.Show(
+                "Could not rotate group:\n   " + groupName + "\n\n" + networkError +
+                "\n\nFully load the assembly (or open the owning subassembly) and try again.",
+                "Rotation failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        return false;
     }
 
     // Raw ComponentAssembly.MoveComponent fallback. This is not used for nested
@@ -986,6 +1018,118 @@ public class AssemblyRotator
         return MoveRaw(owner, target, delta, R, label, loud, false);
     }
 
+    static ComponentAssembly OwnerOf(Part topPart, Component comp)
+    {
+        ComponentAssembly owner = null;
+        try { owner = comp.DirectOwner; } catch { }
+        if (owner == null) owner = topPart.ComponentAssembly;
+        return owner;
+    }
+
+    static bool SameOwner(ComponentAssembly a, ComponentAssembly b)
+    {
+        if (a == null || b == null) return false;
+        try { return a.Tag == b.Tag; } catch { return false; }
+    }
+
+    static bool IsDescendantOf(Component child, Component ancestor)
+    {
+        if (child == null || ancestor == null) return false;
+        try
+        {
+            Component p = child.Parent;
+            while (p != null)
+            {
+                if (p.Tag == ancestor.Tag) return true;
+                p = p.Parent;
+            }
+        }
+        catch { }
+        return false;
+    }
+
+    static bool MapTransformToOwner(Component comp,
+        Vector3d worldDelta, double[,] Rw, out Vector3d delta, out double[,] R)
+    {
+        delta = worldDelta;
+        R = Rw;
+        try
+        {
+            Component parent = comp.Parent;
+            Point3d Ob; Matrix3x3 Mbn;
+            parent.GetPosition(out Ob, out Mbn);
+            double[,] Mb  = MatOf(Mbn);
+            double[,] MbT = Transpose(Mb);
+            R = MatMul(MatMul(Mb, Rw), MbT);
+            double[] rwOb = MatVec(Rw, Ob.X, Ob.Y, Ob.Z);
+            double[] dl = MatVec(Mb,
+                rwOb[0] + worldDelta.X - Ob.X,
+                rwOb[1] + worldDelta.Y - Ob.Y,
+                rwOb[2] + worldDelta.Z - Ob.Z);
+            delta = new Vector3d(dl[0], dl[1], dl[2]);
+            return true;
+        }
+        catch { return false; }
+    }
+
+    static bool MoveGroupInContext(Part topPart, List<Component> comps,
+        Vector3d worldDelta, double[,] Rw, string label)
+    {
+        if (comps == null || comps.Count == 0) return false;
+        if (comps.Count == 1)
+            return MoveInContext(topPart, comps[0], worldDelta, Rw, label, true);
+
+        ComponentAssembly owner = OwnerOf(topPart, comps[0]);
+        for (int i = 1; i < comps.Count; i++)
+        {
+            if (!SameOwner(owner, OwnerOf(topPart, comps[i])))
+            {
+                AppendLog("Group spans multiple owning assemblies; applying same transform one-by-one.");
+                bool allMoved = true;
+                foreach (Component c in comps)
+                    if (!MoveInContext(topPart, c, worldDelta, Rw, label, true))
+                        allMoved = false;
+                return allMoved;
+            }
+        }
+
+        bool topLevel = SameOwner(owner, topPart.ComponentAssembly);
+        Vector3d delta = worldDelta;
+        double[,] R = Rw;
+        if (!topLevel && !MapTransformToOwner(comps[0], worldDelta, Rw, out delta, out R))
+            AppendLog("Group context mapping failed; using world transform.");
+
+        var objs = new List<NXObject>();
+        foreach (Component c in comps)
+        {
+            Component target = c;
+            if (!topLevel)
+            {
+                try
+                {
+                    Component mapped = owner.MapComponentFromParent(c);
+                    if (mapped != null) target = mapped;
+                }
+                catch { }
+            }
+            if (target != null) objs.Add(target);
+        }
+
+        if (objs.Count != comps.Count)
+        {
+            AppendLog("Could not map every group component into the owning assembly; applying same transform one-by-one.");
+            bool allMoved = true;
+            foreach (Component c in comps)
+                if (!MoveInContext(topPart, c, worldDelta, Rw, label, true))
+                    allMoved = false;
+            return allMoved;
+        }
+
+        AppendLog("Moving rigid group: " + comps.Count + " component(s).");
+        return MoveRawGroup(owner, objs.ToArray(), GetBestName(comps[0]) + " group",
+            delta, R, label, true);
+    }
+
     // Rotate one component by angleDeg about the given axis, around the pivot.
     static bool MoveAround(Part topPart, Component comp,
         double angleDeg, string axis, Point3d pivot, string label)
@@ -1031,21 +1175,48 @@ public class AssemblyRotator
         return true;
     }
 
+    static bool MoveAroundAxisGroup(Part topPart, List<Component> comps,
+        double angleDeg, double ax, double ay, double az, Point3d pivot, string label)
+    {
+        if (comps == null || comps.Count == 0) return false;
+        if (comps.Count == 1)
+            return MoveAroundAxis(topPart, comps[0], angleDeg, ax, ay, az, pivot, label);
+
+        double[] axisVec = NormalizeAxis(ax, ay, az);
+        Point3d beforeOrigin;
+        Matrix3x3 beforeMatrix;
+        bool haveBefore = TryGetPosition(comps[0], out beforeOrigin, out beforeMatrix);
+
+        double[,] dR = BuildAxisDR(angleDeg, axisVec[0], axisVec[1], axisVec[2]);
+        Vector3d delta = ComputeDelta(dR, pivot);
+        if (!MoveGroupInContext(topPart, comps, delta, dR, label))
+            return false;
+
+        Point3d afterOrigin;
+        Matrix3x3 afterMatrix;
+        if (haveBefore && TryGetPosition(comps[0], out afterOrigin, out afterMatrix))
+        {
+            double drift = DotAxis(axisVec, afterOrigin) - DotAxis(axisVec, beforeOrigin);
+            if (Math.Abs(drift) > 0.001)
+            {
+                AppendLog(label + " group axial drift " + drift.ToString("F4") +
+                          "; correcting along axis " + AxisVecText(axisVec));
+                Vector3d correction = ScaleAxis(axisVec, -drift);
+                if (!MoveGroupInContext(topPart, comps, correction, Identity3(),
+                    label + " group axis lock"))
+                    return false;
+            }
+        }
+
+        return true;
+    }
+
     // Validate that a rotation angle is a whole multiple of its step angle.
     // Returns false (and shows why) if the angle is not feasible.
     static bool StepOk(double angle, double step, string name)
     {
         if (angle == 0) return true;
-        if (step <= 0)
-        {
-            MessageBox.Show(
-                "Enter the " + name + " step angle first.\n\n" +
-                "The " + name.ToLower() + " has indexed / stepped positions, so its rotation " +
-                "must be a whole multiple of the step angle. This prevents moving it to a " +
-                "position that is not physically feasible.",
-                "Step angle required", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            return false;
-        }
+        if (step <= 0) return true;   // blank/0 = free angle, no indexing enforced
         double ratio = angle / step;
         double nearest = Math.Round(ratio);
         if (Math.Abs(angle - nearest * step) > 0.001)
@@ -1211,7 +1382,7 @@ public class AssemblyRotator
         TextBox coverAngleBox = FT(form, "0", lx+105, y, 70);
         FL(form, "Step angle (deg):", form.Font, Color.Black, lx+200, y+3, 110);
         TextBox coverStepBox = FT(form, "", lx+315, y, 70); y += 24;
-        FL(form, "Cover angle must be a whole multiple of the step angle (its indexed positions).",
+        FL(form, "Optional: enter a step angle to enforce indexed cover positions.",
             form.Font, Color.Gray, lx, y, 590); y += 26;
 
         // Vac valve: ALWAYS rotates with the cover (mandatory – not a user
@@ -1231,12 +1402,12 @@ public class AssemblyRotator
         TextBox outletAngleBox = FT(form, "0", lx+105, y, 70);
         FL(form, "Step angle (deg):", form.Font, Color.Black, lx+200, y+3, 110);
         TextBox outletStepBox = FT(form, "", lx+315, y, 70); y += 24;
-        FL(form, "Multiple of its step angle. All parts constrained to the outlet rotate with it.",
+        FL(form, "Optional step angle. Outlet-connected parts rotate as a rigid group when enabled.",
             form.Font, Color.Gray, lx, y, 590); y += 26;
         CheckBox outletFollowersChk = new CheckBox();
-        outletFollowersChk.Text = "Auto-detect and rotate outlet-connected parts";
+        outletFollowersChk.Text = "Auto-detect and rotate outlet-connected parts as one rigid group";
         outletFollowersChk.Left = lx; outletFollowersChk.Top = y;
-        outletFollowersChk.Width = 420; outletFollowersChk.Checked = false;
+        outletFollowersChk.Width = 560; outletFollowersChk.Checked = true;
         form.Controls.Add(outletFollowersChk); y += 26;
 
         HS(form, lx, y, cw); y += 10;
@@ -1483,25 +1654,30 @@ public class AssemblyRotator
                 double[] coverAxisVec = ResolveAxisVector(axis, axisFrame, bodyComp, coverComp);
                 AppendLog("Cover axis: " + axis + " from " + axisFrame + " " +
                           AxisVecText(coverAxisVec));
-                if (MoveAroundAxis(workPart, coverComp, coverAngle,
+                var coverGroup = new List<Component>();
+                coverGroup.Add(coverComp);
+                bool vacAlreadyInsideCover = IsDescendantOf(vacComp, coverComp);
+                if (vacComp != null && vacComp.Tag != coverComp.Tag && !vacAlreadyInsideCover)
+                    coverGroup.Add(vacComp);
+
+                if (MoveAroundAxisGroup(workPart, coverGroup, coverAngle,
                     coverAxisVec[0], coverAxisVec[1], coverAxisVec[2],
-                    pivot, "Rotate cover"))
+                    pivot, "Rotate cover group"))
                 {
                     RotationOp op = MakeOp(coverComp, coverAngle, axis, coverAxisVec, pivot);
                     newOps.Add(op); applied.Add(op.Description);
                     AppendLog("APPLY  " + op.Description);
 
-                    // Vac valve ALWAYS follows the cover: same angle/axis/pivot.
-                    if (vacComp != null && vacComp != coverComp)
+                    // Vac valve ALWAYS follows the cover: same rigid group move.
+                    if (vacComp != null && vacComp.Tag != coverComp.Tag && !vacAlreadyInsideCover)
                     {
-                        if (MoveAroundAxis(workPart, vacComp, coverAngle,
-                            coverAxisVec[0], coverAxisVec[1], coverAxisVec[2],
-                            pivot, "Rotate vac valve"))
-                        {
-                            RotationOp vop = MakeOp(vacComp, coverAngle, axis, coverAxisVec, pivot);
-                            newOps.Add(vop); applied.Add(vop.Description + "  [with cover]");
-                            AppendLog("APPLY  " + vop.Description + "  [with cover]");
-                        }
+                        RotationOp vop = MakeOp(vacComp, coverAngle, axis, coverAxisVec, pivot);
+                        newOps.Add(vop); applied.Add(vop.Description + "  [with cover]");
+                        AppendLog("APPLY  " + vop.Description + "  [with cover]");
+                    }
+                    else if (vacAlreadyInsideCover)
+                    {
+                        AppendLog("Vac valve is already inside the cover assembly; parent move carries it.");
                     }
                     else if (vacComp == null)
                     {
@@ -1520,28 +1696,28 @@ public class AssemblyRotator
                 double[] outletAxisVec = ResolveAxisVector(axis, axisFrame, bodyComp, outletComp);
                 AppendLog("Outlet axis: " + axis + " from " + axisFrame + " " +
                           AxisVecText(outletAxisVec));
-                if (MoveAroundAxis(workPart, outletComp, outletAngle,
+                var outletGroup = new List<Component>();
+                outletGroup.Add(outletComp);
+                foreach (Component f in outletFollowers)
+                    if (f != null && f.Tag != outletComp.Tag && !IsDescendantOf(f, outletComp))
+                        outletGroup.Add(f);
+
+                if (MoveAroundAxisGroup(workPart, outletGroup, outletAngle,
                     outletAxisVec[0], outletAxisVec[1], outletAxisVec[2],
-                    pivot, "Rotate outlet"))
+                    pivot, "Rotate outlet group"))
                 {
                     RotationOp op = MakeOp(outletComp, outletAngle, axis, outletAxisVec, pivot);
                     newOps.Add(op); applied.Add(op.Description);
                     AppendLog("APPLY  " + op.Description);
 
-                    // Everything connected to the outlet follows it with the same
-                    // angle / axis / pivot (the outlet's equivalent of cover + vac).
+                    // Everything connected to the outlet moved in the same rigid
+                    // group, so there is no relative motion among these parts.
                     foreach (Component f in outletFollowers)
                     {
-                        if (f == outletComp) continue;
-                        AppendLog("Moving connected part: " + GetBestName(f));
-                        if (MoveAroundAxis(workPart, f, outletAngle,
-                            outletAxisVec[0], outletAxisVec[1], outletAxisVec[2],
-                            pivot, "Rotate outlet-attached part"))
-                        {
-                            RotationOp fop = MakeOp(f, outletAngle, axis, outletAxisVec, pivot);
-                            newOps.Add(fop); applied.Add(fop.Description + "  [with outlet]");
-                            AppendLog("APPLY  " + fop.Description + "  [with outlet]");
-                        }
+                        if (f == null || f.Tag == outletComp.Tag || IsDescendantOf(f, outletComp)) continue;
+                        RotationOp fop = MakeOp(f, outletAngle, axis, outletAxisVec, pivot);
+                        newOps.Add(fop); applied.Add(fop.Description + "  [with outlet]");
+                        AppendLog("APPLY  " + fop.Description + "  [with outlet]");
                     }
                 }
             }
