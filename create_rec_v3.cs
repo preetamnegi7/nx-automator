@@ -207,6 +207,7 @@ public class AssemblyRotator
             return true;
         }
         public bool Contains(Tag t) { return _d.ContainsKey(t); }
+        public int Count { get { return _d.Count; } }
     }
 
     class CompInfo
@@ -361,14 +362,17 @@ public class AssemblyRotator
     // UFObj.AskSuppression / SetSuppression are not available in all NX C# builds.
     // We rely solely on NXOpen.Positioning.Constraint.Suppressed (NX9+).
 
-    static List<NXOpen.Positioning.Constraint> SuppressAllConstraints(Part workPart)
+    static void SuppressConstraintsInPart(Part part,
+        List<NXOpen.Positioning.Constraint> suppressed, TagSet scannedParts)
     {
-        var suppressed = new List<NXOpen.Positioning.Constraint>();
+        if (part == null) return;
+        if (!scannedParts.Add(part.Tag)) return;
+
         try
         {
             UFSession ufs = UFSession.GetUFSession();
             Tag tag = Tag.Null;
-            ufs.Obj.CycleObjsInPart(workPart.Tag, -1, ref tag);
+            ufs.Obj.CycleObjsInPart(part.Tag, -1, ref tag);
             while (tag != Tag.Null)
             {
                 try
@@ -382,14 +386,58 @@ public class AssemblyRotator
                     }
                 }
                 catch { }
-                ufs.Obj.CycleObjsInPart(workPart.Tag, -1, ref tag);
+                ufs.Obj.CycleObjsInPart(part.Tag, -1, ref tag);
             }
         }
         catch (Exception ex)
         {
-            AppendLog("Warning: constraint scan failed: " + ex.Message);
+            AppendLog("Warning: constraint scan failed in '" +
+                      SafePartName(part) + "': " + ex.Message);
         }
-        AppendLog("Suppressed " + suppressed.Count + " constraint(s).");
+    }
+
+    static void SuppressConstraintsBelow(Component parent,
+        List<NXOpen.Positioning.Constraint> suppressed, TagSet scannedParts)
+    {
+        if (parent == null) return;
+
+        try
+        {
+            Part proto = parent.Prototype as Part;
+            if (proto != null)
+                SuppressConstraintsInPart(proto, suppressed, scannedParts);
+        }
+        catch { }
+
+        Component[] children;
+        try { children = parent.GetChildren(); }
+        catch { return; }
+
+        foreach (Component child in children)
+            SuppressConstraintsBelow(child, suppressed, scannedParts);
+    }
+
+    static List<NXOpen.Positioning.Constraint> SuppressAllConstraints(Part workPart)
+    {
+        var suppressed = new List<NXOpen.Positioning.Constraint>();
+        var scannedParts = new TagSet();
+
+        // Outlet constraints in this model are authored inside the body
+        // subassembly, not just in the displayed top assembly. Suppress every
+        // loaded prototype part once so nested outlet moves are not solved back.
+        SuppressConstraintsInPart(workPart, suppressed, scannedParts);
+        try
+        {
+            Component root = workPart.ComponentAssembly.RootComponent;
+            SuppressConstraintsBelow(root, suppressed, scannedParts);
+        }
+        catch (Exception ex)
+        {
+            AppendLog("Warning: subassembly constraint scan failed: " + ex.Message);
+        }
+
+        AppendLog("Suppressed " + suppressed.Count + " constraint(s) across " +
+                  scannedParts.Count + " loaded part(s).");
         return suppressed;
     }
 
