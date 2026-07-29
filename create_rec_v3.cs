@@ -1393,21 +1393,31 @@ public class AssemblyRotator
         FL(form, "Vac valve (always rotates with cover): " + Trunc(vacName, 60),
             form.Font, Color.FromArgb(120,80,0), lx, y, 590); y += 24;
 
-        // OUTLET  + step angle
-        FL(form, "OUTLET  (rotated with everything connected to it)",
-            new Font("Segoe UI", 9, FontStyle.Bold), Color.FromArgb(0,130,0), lx, y, 400); y += 20;
-        ComboBox outletCombo = FC(form, allComps, lx, y, cw,
-            autoOutlet >= 0 ? autoOutlet : Math.Min(2, allComps.Count-1)); y += 26;
+        // OUTLET GROUP — the user ticks every part that must rotate together
+        FL(form, "OUTLET  (tick EVERY part that must rotate together as one group)",
+            new Font("Segoe UI", 9, FontStyle.Bold), Color.FromArgb(0,130,0), lx, y, 570); y += 20;
+        CheckedListBox outletList = new CheckedListBox();
+        outletList.Left = lx; outletList.Top = y; outletList.Width = cw; outletList.Height = 92;
+        outletList.Font = new Font("Consolas", 9);
+        outletList.CheckOnClick = true;
+        for (int oi2 = 0; oi2 < allComps.Count; oi2++)
+        {
+            outletList.Items.Add(allComps[oi2].TreeDisplay);
+            string upo = allComps[oi2].FullName.ToUpper();
+            if (upo.Contains("OUTLET") && !upo.Contains("BODY"))
+                outletList.SetItemChecked(oi2, true);
+        }
+        form.Controls.Add(outletList); y += 98;
         FL(form, "Rotation angle:", form.Font, Color.Black, lx, y+3, 100);
         TextBox outletAngleBox = FT(form, "0", lx+105, y, 70);
         FL(form, "Step angle (deg):", form.Font, Color.Black, lx+200, y+3, 110);
         TextBox outletStepBox = FT(form, "", lx+315, y, 70); y += 24;
-        FL(form, "Optional step angle. Outlet-connected parts rotate as a rigid group when enabled.",
-            form.Font, Color.Gray, lx, y, 590); y += 26;
+        FL(form, "Tip: tick the outlet assembly node (its sub-parts follow) plus any mated parts. They rotate as one rigid group.",
+            form.Font, Color.Gray, lx, y, 590); y += 24;
         CheckBox outletFollowersChk = new CheckBox();
-        outletFollowersChk.Text = "Auto-detect and rotate outlet-connected parts as one rigid group";
+        outletFollowersChk.Text = "Also auto-detect constraint-connected parts and add them to the group";
         outletFollowersChk.Left = lx; outletFollowersChk.Top = y;
-        outletFollowersChk.Width = 560; outletFollowersChk.Checked = true;
+        outletFollowersChk.Width = 590; outletFollowersChk.Checked = false;
         form.Controls.Add(outletFollowersChk); y += 26;
 
         HS(form, lx, y, cw); y += 10;
@@ -1552,82 +1562,70 @@ public class AssemblyRotator
             // subassembly when the outlet is nested (this assembly) AND the top
             // assembly — and the body / cover / vac are excluded by tag AND by
             // name so the walk can never flood into the fixed body.
-            List<Component> outletFollowers = new List<Component>();
-            if (outletAngle != 0 && outletFollowersChk.Checked)
+            // ── OUTLET GROUP: the user ticks every part that must rotate together ──
+            // (assembly nodes bring their sub-parts along automatically; mated
+            //  parts are ticked individually). Optionally augment with an
+            //  auto-detected constraint-connected set.
+            List<Component> outletMoveList = new List<Component>();
+            Component outletSeed = null;
+            if (outletAngle != 0)
             {
-                Component outletSeed = allComps[outletCombo.SelectedIndex].Comp;
+                var group = new List<Component>();
+                for (int i = 0; i < outletList.Items.Count; i++)
+                    if (outletList.GetItemChecked(i)) group.Add(allComps[i].Comp);
 
-                var excludeTags = new TagSet();
-                excludeTags.Add(allComps[bodyCombo.SelectedIndex].Comp.Tag);
-                excludeTags.Add(allComps[coverCombo.SelectedIndex].Comp.Tag);
-                if (vacComp != null) excludeTags.Add(vacComp.Tag);
-
-                var excludeNames = new List<string>();
-                excludeNames.Add("BODY");
-                excludeNames.Add("COVER");
-                if (vacComp != null) { excludeNames.Add("VAC"); excludeNames.Add("VALVE"); }
-
-                // Scan both the top assembly and the outlet's owning subassembly,
-                // wherever the positioning constraints happen to be authored.
-                var raw = new List<Component>();
-                AppendLog("Outlet connectivity scan in '" + SafePartName(workPart) + "' (top level).");
-                raw.AddRange(CollectConnectedInPart(workPart, outletSeed, excludeTags, excludeNames));
-                Part subPart = OwningAssemblyPart(workPart, outletSeed);
-                if (subPart.Tag != workPart.Tag)
+                if (group.Count == 0)
                 {
-                    AppendLog("Outlet connectivity scan in '" + SafePartName(subPart) + "' (outlet subassembly).");
-                    raw.AddRange(CollectConnectedInPart(subPart, outletSeed, excludeTags, excludeNames));
+                    MessageBox.Show("Tick at least one part in the OUTLET list to rotate it.",
+                        "No outlet parts selected", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    outletAngle = 0;
                 }
-
-                // Map each connected part back to its occurrence in the displayed
-                // tree (so it rotates through the same proven path as the outlet)
-                // and dedupe by prototype.
-                var seenProto = new TagSet();
-                foreach (Component rc in raw)
+                else
                 {
-                    Component disp = MapToDisplayed(allComps, rc);
-                    if (disp == null || disp.Tag == outletSeed.Tag) continue;
-                    Tag pkey = TryProtoTag(disp);
-                    if (pkey != Tag.Null && !seenProto.Add(pkey)) continue;
-                    outletFollowers.Add(disp);
-                }
+                    outletSeed = group[0];
 
-                AppendLog("Outlet connectivity: " + outletFollowers.Count +
-                          " connected part(s) will rotate with the outlet.");
-                foreach (Component f in outletFollowers)
-                    AppendLog("      + " + GetBestName(f));
-                if (outletFollowers.Count == 0)
-                    AppendLog("      (nothing constraint-linked to the outlet was found; only the outlet moves.)");
-
-                // Confirm the auto-detected group before the slow rotation commits.
-                if (outletFollowers.Count > 0)
-                {
-                    var sb = new System.Text.StringBuilder();
-                    sb.AppendLine("These " + outletFollowers.Count +
-                                  " part(s) are connected to the outlet and will rotate WITH it:");
-                    sb.AppendLine();
-                    foreach (Component f in outletFollowers) sb.AppendLine("    • " + GetBestName(f));
-                    sb.AppendLine();
-                    sb.AppendLine("Yes     = rotate the outlet AND these parts");
-                    sb.AppendLine("No      = rotate the outlet ONLY");
-                    sb.AppendLine("Cancel  = do not rotate the outlet at all");
-                    DialogResult ans = MessageBox.Show(sb.ToString(), "Confirm outlet group",
-                        MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
-                    if (ans == DialogResult.Cancel)
+                    // Optional: also pull in constraint-connected parts.
+                    if (outletFollowersChk.Checked)
                     {
-                        outletAngle = 0; outletFollowers.Clear();
-                        AppendLog("Outlet rotation cancelled by user.");
+                        var excludeTags = new TagSet();
+                        excludeTags.Add(allComps[bodyCombo.SelectedIndex].Comp.Tag);
+                        excludeTags.Add(allComps[coverCombo.SelectedIndex].Comp.Tag);
+                        if (vacComp != null) excludeTags.Add(vacComp.Tag);
+                        var excludeNames = new List<string>();
+                        excludeNames.Add("BODY"); excludeNames.Add("COVER");
+                        if (vacComp != null) { excludeNames.Add("VAC"); excludeNames.Add("VALVE"); }
+
+                        var raw = new List<Component>();
+                        raw.AddRange(CollectConnectedInPart(workPart, outletSeed, excludeTags, excludeNames));
+                        Part subPart = OwningAssemblyPart(workPart, outletSeed);
+                        if (subPart.Tag != workPart.Tag)
+                            raw.AddRange(CollectConnectedInPart(subPart, outletSeed, excludeTags, excludeNames));
+
+                        var have = new TagSet();
+                        foreach (Component g in group) have.Add(g.Tag);
+                        foreach (Component rc in raw)
+                        {
+                            Component disp = MapToDisplayed(allComps, rc);
+                            if (disp == null) continue;
+                            if (have.Add(disp.Tag)) { group.Add(disp); AppendLog("Outlet auto-add: " + GetBestName(disp)); }
+                        }
                     }
-                    else if (ans == DialogResult.No)
+
+                    // Drop any part already carried by another checked assembly
+                    // node (its ancestor's move already moves it) to avoid a
+                    // double rotation.
+                    foreach (Component g in group)
                     {
-                        outletFollowers.Clear();
-                        AppendLog("Rotating outlet only (connected parts skipped by user).");
+                        bool carried = false;
+                        foreach (Component other in group)
+                            if (other.Tag != g.Tag && IsDescendantOf(g, other)) { carried = true; break; }
+                        if (carried)
+                            AppendLog("Outlet: skip " + GetBestName(g) + " (already inside another ticked node).");
+                        else
+                            outletMoveList.Add(g);
                     }
+                    AppendLog("Outlet group: " + outletMoveList.Count + " node(s) will rotate together.");
                 }
-            }
-            else if (outletAngle != 0)
-            {
-                AppendLog("Outlet connected-part scan skipped; rotating selected outlet only.");
             }
 
             // After an outlet-only cancel there may be nothing left to rotate.
@@ -1686,38 +1684,26 @@ public class AssemblyRotator
                 }
             }
 
-            if (outletAngle != 0)
+            if (outletAngle != 0 && outletMoveList.Count > 0)
             {
-                CompInfo oi = allComps[outletCombo.SelectedIndex];
-                AppendLog("Outlet target: " + oi.FullName + "  (tree level " + oi.Level + ")");
-                string axisFrame = axisFrameCombo.SelectedItem.ToString();
-                Component bodyComp = allComps[bodyCombo.SelectedIndex].Comp;
-                Component outletComp = oi.Comp;
-                double[] outletAxisVec = ResolveAxisVector(axis, axisFrame, bodyComp, outletComp);
-                AppendLog("Outlet axis: " + axis + " from " + axisFrame + " " +
+                string axisFrameO = axisFrameCombo.SelectedItem.ToString();
+                Component bodyCompO = allComps[bodyCombo.SelectedIndex].Comp;
+                double[] outletAxisVec = ResolveAxisVector(axis, axisFrameO, bodyCompO, outletSeed);
+                AppendLog("Outlet axis: " + axis + " from " + axisFrameO + " " +
                           AxisVecText(outletAxisVec));
-                var outletGroup = new List<Component>();
-                outletGroup.Add(outletComp);
-                foreach (Component f in outletFollowers)
-                    if (f != null && f.Tag != outletComp.Tag && !IsDescendantOf(f, outletComp))
-                        outletGroup.Add(f);
 
-                if (MoveAroundAxisGroup(workPart, outletGroup, outletAngle,
+                if (MoveAroundAxisGroup(workPart, outletMoveList, outletAngle,
                     outletAxisVec[0], outletAxisVec[1], outletAxisVec[2],
                     pivot, "Rotate outlet group"))
                 {
-                    RotationOp op = MakeOp(outletComp, outletAngle, axis, outletAxisVec, pivot);
-                    newOps.Add(op); applied.Add(op.Description);
-                    AppendLog("APPLY  " + op.Description);
-
-                    // Everything connected to the outlet moved in the same rigid
-                    // group, so there is no relative motion among these parts.
-                    foreach (Component f in outletFollowers)
+                    bool first = true;
+                    foreach (Component g in outletMoveList)
                     {
-                        if (f == null || f.Tag == outletComp.Tag || IsDescendantOf(f, outletComp)) continue;
-                        RotationOp fop = MakeOp(f, outletAngle, axis, outletAxisVec, pivot);
-                        newOps.Add(fop); applied.Add(fop.Description + "  [with outlet]");
-                        AppendLog("APPLY  " + fop.Description + "  [with outlet]");
+                        RotationOp op = MakeOp(g, outletAngle, axis, outletAxisVec, pivot);
+                        newOps.Add(op);
+                        applied.Add(op.Description + (first ? "" : "  [with outlet]"));
+                        AppendLog("APPLY  " + op.Description + (first ? "" : "  [with outlet]"));
+                        first = false;
                     }
                 }
             }
